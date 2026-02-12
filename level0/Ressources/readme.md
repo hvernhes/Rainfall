@@ -1,173 +1,224 @@
-# Utilisation de Ghidra pour la décompilation
+# Sur ta machine Linux/Mac
+cat > level0_README.md << 'EOF'
+# Level0 - README Pédagogique
 
-Ce guide explique comment installer et utiliser Ghidra pour décompiler un binaire ELF.
+## 🎯 Objectif
+Exploiter une **faille logique combinée au bit SUID** pour obtenir un shell avec les privilèges de `level1`.
 
 ---
 
-## Installation de Ghidra
+## 🔍 Reconnaissance
 
-### Prérequis : Java 21+
+### Permissions du fichier
 ```bash
-# Vérifier la version de Java
-java -version
-
-# Si nécessaire, installer Java 21
-sudo apt update
-sudo apt install openjdk-21-jdk
+$ ls -l level0
+-rwsr-x---+ 1 level1 users  747441 Mar  6  2016 level0
+    ^
+    └─ Bit SUID actif
 ```
 
-### Télécharger et installer Ghidra
+**Observation clé** : Le binaire s'exécute avec les droits de `level1` (propriétaire) grâce au bit SUID.
+
+### Tests comportementaux
 ```bash
-cd ~/downloads
+$ ./level0
+Segmentation fault (core dumped)
 
-# Télécharger Ghidra (version 11.2.1)
-wget https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241105.zip
+$ ./level0 42
+No !
 
-# Décompresser
-unzip ghidra_11.2.1_PUBLIC_20241105.zip
-cd ghidra_11.2.1_PUBLIC
-
-# Lancer Ghidra
-./ghidraRun
+$ ./level0 test
+No !
 ```
+
+**Hypothèse** : Le programme attend un argument numérique spécifique.
 
 ---
 
-## Décompilation d'un binaire
+## 🛠️ Analyse technique
 
-### 1. Récupérer le binaire depuis la VM
+### Code décompilé (Ghidra)
+```c
+void main(int argc, char **argv)
+{
+    int input;
+    char *shell_args[2];
+    gid_t egid;
+    uid_t euid;
+    
+    input = atoi(argv[1]);  // ⚠️ Pas de vérification de argc !
+    
+    if (input == 423) {     // 0x1a7 en hexadécimal
+        shell_args[0] = "/bin/sh";
+        shell_args[1] = NULL;
+        
+        egid = getegid();
+        euid = geteuid();
+        
+        setresgid(egid, egid, egid);
+        setresuid(euid, euid, euid);
+        
+        execv("/bin/sh", shell_args);
+    } else {
+        fwrite("No !\n", 1, 5, stderr);
+    }
+}
+```
+
+### Analyse GDB
 ```bash
-# Copier le binaire via SCP
-scp -P 4242 level0@192.168.1.45:~/level0 ~/downloads/
+$ gdb level0
+(gdb) disas main
 ```
 
-### 2. Créer un projet Ghidra
-
-1. `File` → `New Project`
-2. Sélectionner **Non-Shared Project**
-3. Nom du projet : `Rainfall`
-4. Choisir un emplacement
-5. Cliquer `Finish`
-
-### 3. Importer le binaire
-
-1. `File` → `Import File`
-2. Naviguer vers le binaire (ex: `~/downloads/level0`)
-3. Sélectionner le fichier
-4. Ghidra détecte automatiquement :
-   - **Format** : Executable and Linking Format (ELF)
-   - **Language** : x86:LE:32:default (Intel 80386, little endian)
-5. Cliquer `OK`
-
-### 4. Analyser le binaire
-
-1. Double-cliquer sur le binaire dans la liste du projet
-2. Pop-up : **"level0 has not been analyzed. Would you like to analyze it now?"**
-3. Cliquer `Yes`
-4. Garder les options d'analyse par défaut
-5. Cliquer `Analyze`
-6. Attendre la fin de l'analyse (10-20 secondes)
-
-### 5. Naviguer vers la fonction main
-
-**Interface Ghidra (3 panneaux) :**
-```
-┌──────────────┬─────────────────────┬──────────────────┐
-│ Symbol Tree  │ Listing (ASM)       │ Decompile (C)    │
-│              │                     │                  │
-│ - Functions  │ 08048ec0 PUSH EBP   │ int main(...) {  │
-│   - main     │ 08048ec1 MOV ...    │   int input;     │
-│   - atoi     │ ...                 │   ...            │
-└──────────────┴─────────────────────┴──────────────────┘
+**Instructions critiques** :
+```asm
+0x08048ed4 <+20>:    call   0x8049710 <atoi>
+0x08048ed9 <+25>:    cmp    $0x1a7,%eax
+0x08048ede <+30>:    jne    0x8048f58 <main+152>
 ```
 
-1. **Panneau gauche** : Symbol Tree → Dérouler **Functions**
-2. Chercher et double-cliquer sur `main`
-3. Le code décompilé apparaît dans le **panneau de droite**
+**Calcul de la valeur attendue** :
+```
+0x1a7 = (1 × 256) + (10 × 16) + (7 × 1) = 423
+```
 
 ---
 
-## Améliorer la lisibilité du code décompilé
+## 💣 Vulnérabilités identifiées
 
-### Éditer la signature de la fonction
+### 1. NULL Pointer Dereference
+**Code vulnérable** :
+```c
+int input = atoi(argv[1]);  // argv[1] peut être NULL si argc == 1
+```
 
-1. Dans le **panneau Listing** (centre), clic droit sur `main`
-2. Sélectionner **`Edit Function Signature`**
-3. Modifier la signature :
-   - De : `undefined4 main(undefined4 param_1, int param_2)`
-   - Vers : `int main(int argc, char **argv)`
-4. Cliquer `OK`
+**Explication** :
+- Sans argument, `argv[1]` vaut `NULL`
+- `atoi()` tente de lire à l'adresse `0x00000000`
+- Accès mémoire invalide → **SIGSEGV**
 
-### Renommer les variables
+### 2. Logic Flaw (Valeur magique hard-codée)
+**Code vulnérable** :
+```c
+if (input == 423) {  // Valeur facilement trouvable
+    // Lance un shell
+}
+```
 
-**Dans le panneau Decompile (droite) :**
+**Explication** :
+- La valeur `0x1a7` (423) est visible dans le code assembleur
+- Aucune obscurcissement ni vérification supplémentaire
+- Simple comparaison directe
 
-1. Clic droit sur une variable (ex: `iVar1`)
-2. Sélectionner **`Rename Variable`**
-3. Entrer un nom explicite (ex: `input`)
-4. Cliquer `OK`
+### 3. SUID Privilege Escalation
+**Mécanisme** :
+```c
+egid = getegid();  // Récupère l'EGID effectif (level1)
+euid = geteuid();  // Récupère l'EUID effectif (level1)
 
-### Changer le type d'une variable
+setresgid(egid, egid, egid);  // Force RGID=EGID=SGID
+setresuid(euid, euid, euid);  // Force RUID=EUID=SUID
 
-**Exemple : Transformer une variable en tableau**
+execv("/bin/sh", shell_args);  // Lance le shell
+```
 
-1. Clic droit sur la variable
-2. Sélectionner **`Retype Variable`**
-3. Modifier le type (ex: `char *` → `char *[2]`)
-4. Cliquer `OK`
-
-### Convertir une valeur hexadécimale en décimal
-
-1. Dans le panneau Decompile, clic droit sur la valeur (ex: `0x1a7`)
-2. **`Convert`** → **`Decimal`**
-3. La valeur devient `423`
+**Explication** :
+- Le bit SUID donne `EUID = level1`
+- Par défaut, `/bin/sh` détecte le SUID et drop les privilèges
+- `setresuid(euid, euid, euid)` force `RUID = EUID` → le shell ne détecte plus de différence → ne drop pas
 
 ---
 
-## Exporter le code décompilé
+## 🔑 Concepts clés
 
-1. Dans le **panneau Decompile**, sélectionner le code
-2. **Clic droit** → **`Copy to Clipboard`** (ou `Ctrl+C`)
-3. Coller dans votre fichier `source`
-4. Nettoyer et annoter le code manuellement
+### Le bit SUID
+```
+-rwsr-x---
+    ^
+    └─ 's' = SUID bit
+```
+
+**Fonctionnement** :
+- Le binaire s'exécute avec les **droits du propriétaire** (level1)
+- Pas avec les droits de celui qui le lance (level0)
+
+### Les 3 types d'UID sous Linux
+
+| Type | Nom | Description |
+|------|-----|-------------|
+| **RUID** | Real UID | Qui a lancé le processus |
+| **EUID** | Effective UID | Privilèges effectifs (utilisé pour les permissions) |
+| **SUID** | Saved UID | Sauvegarde pour revenir en arrière |
+
+**Dans notre cas** :
+```
+Avant ./level0 :
+  RUID = level0
+  EUID = level0
+  SUID = level0
+
+Pendant ./level0 (grâce au SUID bit) :
+  RUID = level0
+  EUID = level1  ← Permet de lire /home/user/level1/.pass
+  SUID = level1
+
+Après setresuid(euid, euid, euid) :
+  RUID = level1  ← Changé !
+  EUID = level1
+  SUID = level1
+```
+
+### Conversion hexadécimale
+```
+0x1a7 → decimal
+
+Position : 16²   16¹   16⁰
+Chiffre  :  1     a     7
+Valeur   : 256   10     1
+
+Calcul : (1 × 256) + (10 × 16) + (7 × 1) = 423
+```
 
 ---
 
-## Résoudre les problèmes courants
+## 🚀 Exploitation
 
-### Erreur : "Project is locked"
-
-Le fichier de verrouillage n'a pas été supprimé correctement.
-
-**Solution :**
+### Payload
 ```bash
-# Tuer tous les processus Ghidra
-pkill -9 -f ghidra
-
-# Supprimer les fichiers de verrouillage
-cd ~/ghidra-projects/Rainfall
-rm -f .lock *.lock
-rm -rf .project.lock
+$ ./level0 423
 ```
 
-### Ghidra ne trouve pas Java
+### Vérification
 ```bash
-# Trouver le chemin Java
-readlink -f $(which java)
-# Exemple de résultat : /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+$ whoami
+level1
 
-# Définir JAVA_HOME
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+$ id
+uid=2030(level1) gid=2030(level1) groups=2030(level1),100(users)
+```
 
-# Relancer Ghidra
-./ghidraRun
+### Récupération du flag
+```bash
+$ cat /home/user/level1/.pass
+1fe8a524fa4bec01ca4ea2a869af2a02260d4a7d5fe7e7c24d8617e6dca12d3a
 ```
 
 ---
 
-## Notes importantes
+## 📝 Classification
 
-- Ghidra laisse parfois les constantes en **hexadécimal** (ex: `0x1a7`) pour préserver la forme originale
-- Les noms de variables générés (`local_1c`, `iVar1`) doivent être renommés pour la lisibilité
-- Le code décompilé est un **point de départ** : il faut le nettoyer et l'annoter manuellement
-- Ghidra peut générer des types système avec des préfixes (`__gid_t`, `__uid_t`) qui peuvent être simplifiés
+**Type de vulnérabilités** :
+- **CWE-476** : NULL Pointer Dereference
+- **CWE-798** : Use of Hard-coded Credentials
+- **CWE-250** : Execution with Unnecessary Privileges
+
+---
+
+## 🎓 Résumé
+
+1. **Faille** : Valeur magique hard-codée (423) + Bit SUID
+2. **Exploitation** : Passer `423` comme argument
+3. **Résultat** : Shell avec les privilèges de `level1`
+4. **Flag** : `1fe8a524fa4bec01ca4ea2a869af2a02260d4a7d5fe7e7c24d8617e6dca12d3a`
+EOF
