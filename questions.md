@@ -1341,3 +1341,857 @@ dis le moi
 
 dis le moi
 
+# Level8 - Réponses aux questions de compréhension
+
+## Question 1 : La logique du programme
+
+### Que fait la commande `auth` exactement ?
+
+```c
+if (strncmp(buffer, "auth ", 5) == 0) {
+    auth = malloc(4);           // Alloue 4 bytes sur le heap
+    auth[0] = 0;                // Initialise à 0 (NULL byte)
+    if (strlen(buffer + 5) < 30) {
+        strcpy(auth, buffer + 5);  // Copie le reste de la ligne
+    }
+}
+```
+
+**Explication** :
+1. Alloue **4 bytes** pour `auth` sur le heap
+2. Met le premier byte à 0
+3. Si l'argument fait moins de 30 chars, le copie dans `auth`
+
+**Exemple** :
+```
+auth test
+→ auth pointe vers un bloc de 4 bytes contenant "test\0"
+```
+
+### Pourquoi `malloc(4)` alors qu'on copie potentiellement plus de 4 bytes ?
+
+**C'est un bug !** Le développeur a fait une erreur :
+
+```c
+auth = malloc(4);              // Alloue SEULEMENT 4 bytes
+strcpy(auth, buffer + 5);      // Peut copier jusqu'à 29 bytes !
+```
+
+**Résultat** : **Heap overflow** ! Si `buffer + 5` contient plus de 4 bytes, on déborde sur les données adjacentes sur le heap.
+
+**C'est exactement ce qu'on exploite.**
+
+### Que fait la commande `reset` ? Quel est le problème ?
+
+```c
+if (strncmp(buffer, "reset", 5) == 0) {
+    free(auth);
+}
+```
+
+**Ce qui se passe** :
+1. Libère la mémoire pointée par `auth`
+2. **MAIS ne met PAS `auth` à NULL !**
+
+**Le problème : Dangling pointer** :
+```c
+free(auth);  // Libère la mémoire
+// auth pointe toujours vers 0x0804a008 (l'ancienne adresse)
+// Mais cette mémoire est maintenant LIBRE
+```
+
+**Conséquence** : `auth` pointe vers une zone mémoire qui peut être réallouée par un autre `malloc()` !
+
+### Que fait `service` ?
+
+```c
+if (strncmp(buffer, "service", 7) == 0) {
+    service = strdup(buffer + 8);
+}
+```
+
+**Explication** :
+1. Lit tout après `"service "` (buffer + 8 car "service " = 8 chars avec l'espace)
+2. `strdup()` alloue de la mémoire sur le heap et copie la chaîne
+3. `service` pointe vers ce nouveau bloc
+
+**Exemple** :
+```
+service admin
+→ strdup("admin") alloue ~6 bytes et y copie "admin\0"
+→ service = 0x0804a018
+```
+
+---
+
+## Question 2 : La condition de victoire
+
+### Que lit cette condition ?
+
+```c
+if (*(int *)(auth + 32) == 0) {
+    fwrite("Password:\n", 1, 10, stdout);
+} else {
+    system("/bin/sh");  // ← On veut arriver ici !
+}
+```
+
+**Décodage** :
+```c
+*(int *)(auth + 32)
+  ^^^^   ^^^^^^^^
+  Cast   Adresse
+  en int auth + 32 bytes
+
+Ça lit 4 bytes (un int) à l'adresse auth + 32
+```
+
+**Exemple** :
+```
+auth = 0x0804a008
+auth + 32 = 0x0804a028
+
+*(int *)(0x0804a028) → Lit les 4 bytes à cette adresse
+```
+
+### Pourquoi `auth + 32` alors que `malloc(4)` ?
+
+**C'est volontaire (ou un bug de conception) !**
+
+Le développeur vérifie une zone **au-delà** du bloc alloué pour `auth`.
+
+```
+auth = malloc(4)  → Alloue 4 bytes
+
+auth + 32 → Pointe 32 bytes APRÈS le début de auth
+           → C'est HORS du bloc alloué !
+           → Lecture hors limites (out-of-bounds read)
+```
+
+**Cette zone mémoire peut contenir** :
+- D'autres allocations sur le heap
+- Des données résiduelles
+- Des headers malloc
+
+**C'est ce qu'on exploite !**
+
+### Pour obtenir le shell, que doit contenir `auth + 32` ?
+
+```c
+if (*(int *)(auth + 32) == 0) {
+    // Condition FAUSSE → pas de shell
+} else {
+    system("/bin/sh");  // Condition VRAIE → shell !
+}
+```
+
+**Pour le shell** : `auth + 32` doit contenir **N'IMPORTE QUOI SAUF 0**.
+
+Si `*(int *)(auth + 32) != 0` → Shell ! ✅
+
+---
+
+## Question 3 : Les variables globales
+
+### Où sont stockées ces variables ?
+
+```c
+char *auth = NULL;
+char *service = NULL;
+```
+
+**Section `.bss`** (variables globales non initialisées) :
+```
+0x0804a000  .bss  ← auth et service sont ici
+```
+
+**Ce sont des POINTEURS** (4 bytes chacun sur 32-bit) qui pointent vers le heap.
+
+### `auth` et `service` pointent vers quoi ?
+
+**Avant toute commande** :
+```
+auth = NULL (0x00000000)
+service = NULL (0x00000000)
+```
+
+**Après `auth test`** :
+```
+auth = 0x0804a008  ← Pointe vers le heap
+```
+
+**Après `service admin`** :
+```
+service = 0x0804a018  ← Pointe vers le heap (allocation différente)
+```
+
+### Les pointeurs sont sur la stack ou le heap ?
+
+**Les pointeurs EUX-MÊMES** : Dans la section `.bss` (données globales)
+**Ce qu'ils POINTENT** : Sur le heap
+
+```
+.bss (0x0804a000) :
+┌─────────────────┐
+│ auth = 0x0804a008 │ ← Pointeur (4 bytes) dans .bss
+└─────────────────┘
+        ↓
+Heap (0x0804a008) :
+┌─────────────────┐
+│ "test\0"        │ ← Données sur le heap
+└─────────────────┘
+```
+
+---
+
+## Question 4 : Le problème avec reset
+
+### Après `free(auth)`, que vaut le pointeur `auth` ?
+
+```c
+free(auth);
+// auth pointe toujours vers 0x0804a008 !
+// Mais cette mémoire est maintenant LIBRE
+```
+
+**`free()` ne modifie PAS le pointeur**, seulement l'état de la mémoire.
+
+```
+Avant free(auth) :
+auth = 0x0804a008 → [données allouées]
+
+Après free(auth) :
+auth = 0x0804a008 → [mémoire libre, peut être réallouée]
+```
+
+### C'est quoi un dangling pointer ?
+
+**Dangling pointer** (pointeur pendant) = Pointeur qui pointe vers une mémoire qui a été libérée.
+
+```c
+char *ptr = malloc(10);
+strcpy(ptr, "test");
+free(ptr);         // Libère la mémoire
+// ptr pointe toujours vers la même adresse !
+// Mais cette mémoire est libre → DANGLING POINTER
+printf("%s", ptr); // ⚠️ Comportement indéfini !
+```
+
+**Correct** :
+```c
+free(ptr);
+ptr = NULL;  // Évite le dangling pointer
+```
+
+### Que se passe-t-il si on fait `login` après `reset` ?
+
+```c
+reset           // free(auth), mais auth != NULL
+login           // Lit auth + 32
+```
+
+**Deux scénarios** :
+
+**Scénario 1 : La mémoire n'est pas réallouée**
+```
+auth + 32 contient toujours 0 → "Password:\n"
+```
+
+**Scénario 2 : La mémoire EST réallouée (notre exploit !)**
+```
+service XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+→ strdup() alloue à l'ancienne adresse de auth
+→ auth + 32 pointe maintenant DANS le bloc service
+→ auth + 32 contient "XXXX" (non NULL)
+→ Shell ! ✅
+```
+
+---
+
+## Question 5 : La stratégie d'exploitation
+
+### Pourquoi utiliser `service` et pas juste `auth` avec un long input ?
+
+**Avec `auth` seul** :
+```c
+if (strlen(buffer + 5) < 30) {  // Maximum 29 chars
+    strcpy(auth, buffer + 5);
+}
+```
+
+**Problème** : Limité à 29 chars, et on ne contrôle pas précisément où ça va sur le heap.
+
+**Avec la séquence `auth` + `service`** :
+```
+1. auth test       → Alloue à 0x0804a008
+2. service XXXX... → Alloue juste APRÈS
+                   → Tombe à auth + N bytes
+```
+
+**Pourquoi c'est mieux** :
+- `service` peut être aussi long qu'on veut
+- On contrôle précisément le placement sur le heap
+- Plus fiable pour atteindre `auth + 32`
+
+### Quand on fait `service`, où est alloué le nouveau buffer ?
+
+**Sur le heap, juste après `auth`** (allocations séquentielles) :
+
+```
+Heap après auth test :
+0x0804a008  auth (4 bytes + header)
+
+Heap après service XXXX... :
+0x0804a008  auth (4 bytes + header)
+0x0804a018  service (longueur variable + header)
+```
+
+**La distance dépend de** :
+- Taille de l'allocation `auth`
+- Headers malloc
+- Alignement
+
+### Comment `service` permet de satisfaire `auth + 32` ?
+
+**Calcul** :
+```
+auth = 0x0804a008
+
+Avec headers malloc (8 bytes) :
+auth + 32 ≈ 0x0804a008 + 32 = 0x0804a028
+
+Si service est alloué à 0x0804a018 (juste après auth) :
+service occupe 0x0804a018 → 0x0804a0XX
+
+auth + 32 (0x0804a028) tombe DANS le bloc service !
+```
+
+**Si `service` contient des données** :
+```
+auth + 32 lit les bytes de service
+→ Si service = "XXXXXXXXXXXXXXXXXXXXXXXX"
+→ auth + 32 contient "XXXX" (non NULL)
+→ Condition vraie → Shell ! ✅
+```
+
+---
+
+## Question 6 : Le heap layout
+
+### Layout du heap après `auth test` puis `service test`
+
+```
+Avant toute commande :
+Heap vide
+
+Après "auth test" :
+0x0804a000  Header auth (8 bytes)
+0x0804a008  auth: "test\0" (4 bytes alloués, ~5 utilisés)
+            ^^^^^^^^^^^^^^
+            auth pointe ici
+
+Après "service test" :
+0x0804a000  Header auth (8 bytes)
+0x0804a008  auth: "test\0" (4 bytes)
+0x0804a010  Header service (8 bytes)
+0x0804a018  service: "test\0" (~6 bytes)
+            ^^^^^^^^^^^^^^^^
+            service pointe ici
+```
+
+**Note** : Les tailles exactes dépendent de `malloc()` et de l'alignement.
+
+### Où est `auth` ? Où est `service` ?
+
+```
+auth = 0x0804a008     (pointeur vers le heap)
+service = 0x0804a018  (pointeur vers le heap, ~16 bytes après auth)
+```
+
+### Pourquoi `service` se retrouve à `auth + 32` ou proche ?
+
+**Pas exactement à `auth + 32`, mais proche !**
+
+```
+auth = 0x0804a008
+auth + 32 = 0x0804a028
+
+service = 0x0804a018
+
+Si service contient au moins 16 bytes de données :
+service[0..15] = positions 0x0804a018 → 0x0804a027
+service[16]    = position 0x0804a028 ← C'est auth + 32 ! ✅
+```
+
+**Donc si `service` est assez long, il "recouvre" `auth + 32` !**
+
+---
+
+## Question 7 : strdup()
+
+### Que fait `strdup()` ?
+
+```c
+char *strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *new = malloc(len);
+    if (new) strcpy(new, s);
+    return new;
+}
+```
+
+**En résumé** :
+1. Calcule la longueur de la chaîne
+2. Alloue exactement cette taille (+1 pour `\0`)
+3. Copie la chaîne
+4. Retourne le pointeur
+
+**Équivalent à** : `malloc()` + `strcpy()`
+
+### Pourquoi `buffer + 8` et pas `buffer + 7` ?
+
+```
+buffer = "service test\n"
+          0123456789...
+          
+"service" = 7 caractères
+Mais on veut sauter "service " (avec l'ESPACE) = 8 caractères
+
+buffer + 8 = "test\n"
+```
+
+**Explication** :
+```
+buffer[0..6] = "service"
+buffer[7]    = " " (espace)
+buffer[8..N] = "test\n" ← Ce qu'on veut copier
+```
+
+### Différence entre `malloc()` + `strcpy()` et `strdup()` ?
+
+| | malloc() + strcpy() | strdup() |
+|---|---|---|
+| **Nb d'étapes** | 2 (allouer + copier) | 1 (tout-en-un) |
+| **Taille** | Tu choisis | Automatique (strlen + 1) |
+| **Erreur possible** | Oublier le +1 pour `\0` | Non |
+| **Utilisation** | Plus de contrôle | Plus simple |
+
+**Exemple** :
+```c
+// Version manuelle
+char *copy1 = malloc(strlen(s) + 1);
+strcpy(copy1, s);
+
+// Version strdup
+char *copy2 = strdup(s);  // Équivalent mais plus court
+```
+
+---
+
+## Résumé de la vulnérabilité
+
+**Enchaînement d'exploitation** :
+
+1. **`auth test`** → Alloue 4 bytes à 0x0804a008
+2. **`service` + long input** → Alloue juste après auth
+3. **Condition `auth + 32`** → Pointe DANS le bloc service
+4. **Si service contient des données** → `auth + 32 != 0`
+5. **Shell obtenu !** ✅
+
+**Les bugs exploités** :
+- `malloc(4)` trop petit
+- Pas de vérification sur `auth + 32`
+- `free()` sans mettre à NULL (dangling pointer)
+- Out-of-bounds read sur `auth + 32`
+
+# Level9 - Questions/Réponses de compréhension
+
+## Question 1 : C++ et les objets
+
+### Qu'est-ce qu'une classe en C++ ?
+
+Une **classe** est un modèle pour créer des objets. Elle définit des données (attributs) et des fonctions (méthodes).
+
+```cpp
+class N {
+private:
+    int value;           // Attribut
+    char annotation[100]; // Attribut
+
+public:
+    N(int n) { ... }     // Constructeur
+    void setAnnotation(char *str) { ... }  // Méthode
+};
+```
+
+**Différence avec C** :
+- C : structures (`struct`) sans méthodes
+- C++ : classes avec méthodes et encapsulation
+
+### Qu'est-ce qu'un objet ?
+
+Un **objet** est une instance d'une classe.
+
+```cpp
+N *obj1 = new N(5);  // obj1 est un objet de type N
+```
+
+**En mémoire** :
+```
+obj1 → [vtable ptr][annotation[100]][value]
+       0x0804a008  (108 bytes sur le heap)
+```
+
+### Que fait `new N(5)` ?
+
+```cpp
+N *obj1 = new N(5);
+```
+
+**Équivalent C** :
+```c
+N *obj1 = malloc(sizeof(N));
+N_constructor(obj1, 5);
+```
+
+**Étapes** :
+1. Alloue `sizeof(N)` bytes sur le heap (108 bytes ici)
+2. Appelle le constructeur `N(5)`
+3. Retourne un pointeur vers l'objet
+
+---
+
+## Question 2 : La vtable (table virtuelle)
+
+### Qu'est-ce qu'une vtable ?
+
+Une **vtable** (virtual table) est un tableau de pointeurs vers les méthodes virtuelles d'une classe.
+
+**Chaque objet avec des méthodes virtuelles contient un pointeur vers sa vtable.**
+
+```
+Classe N :
+┌──────────────────────┐
+│ vtable de la classe  │
+├──────────────────────┤
+│ operator+() @ 0x...  │
+│ operator-() @ 0x...  │
+└──────────────────────┘
+
+Objet obj1 :
+┌──────────────────────┐
+│ vtable_ptr → vtable  │ ← Pointe vers la vtable de N
+├──────────────────────┤
+│ annotation[100]      │
+├──────────────────────┤
+│ value = 5            │
+└──────────────────────┘
+```
+
+### Pourquoi une vtable ?
+
+Pour le **polymorphisme dynamique** (appels de méthodes virtuelles résolus à l'exécution).
+
+```cpp
+class Base {
+    virtual void foo() { ... }
+};
+
+class Derived : public Base {
+    void foo() override { ... }
+};
+
+Base *ptr = new Derived();
+ptr->foo();  // Appelle Derived::foo() grâce à la vtable !
+```
+
+### Comment fonctionne un appel de méthode virtuelle ?
+
+```cpp
+obj2->operator+(obj1);
+```
+
+**Étapes** :
+1. Lire `obj2->vtable` (premier champ de l'objet)
+2. Chercher `operator+` dans la vtable (première entrée)
+3. Appeler la fonction à cette adresse
+
+**En assembleur** :
+```asm
+mov eax, [obj2]        ; Lire vtable pointer
+mov edx, [eax]         ; Lire première entrée (operator+)
+call edx               ; Appeler la fonction
+```
+
+### Où est stockée la vtable ?
+
+**La vtable elle-même** : Dans la section `.rodata` (données read-only du binaire)
+**Le pointeur vtable** : Dans chaque objet (premier champ)
+
+```
+Binaire (.rodata) :
+0x08048xxx  vtable_N:
+            [adresse operator+]
+            [adresse operator-]
+
+Heap :
+0x0804a008  obj1:
+            [0x08048xxx] ← Pointe vers vtable_N
+            [annotation]
+            [value]
+```
+
+---
+
+## Question 3 : La vulnérabilité
+
+### Quelle est la vulnérabilité dans setAnnotation() ?
+
+```cpp
+void setAnnotation(char *str) {
+    size_t len = strlen(str);
+    memcpy(this->annotation, str, len);  // ⚠️ Pas de vérification !
+}
+```
+
+**Problème** : `annotation` fait 100 bytes, mais on peut copier `len` bytes (illimité).
+
+**Heap overflow** : Si `len > 100`, on déborde sur les données adjacentes (l'objet obj2).
+
+### Pourquoi `this + 4` dans le code décompilé ?
+
+```cpp
+memcpy(this + 4, str, len);
+```
+
+**`this`** = pointeur vers l'objet = `0x0804a008`
+
+**Structure de l'objet** :
+```
+this + 0 : vtable pointer (4 bytes)
+this + 4 : annotation[100] (100 bytes) ← On écrit ici
+this + 104 : value (4 bytes)
+```
+
+**`this + 4`** saute le pointeur vtable et écrit dans `annotation`.
+
+### Que se passe-t-il si on overflow ?
+
+```
+obj1 (0x0804a008):
+  +0   : [vtable]
+  +4   : [annotation] ← setAnnotation écrit ici
+  +104 : [value]
+
+obj2 (0x0804a074 = obj1 + 108):
+  +0   : [vtable] ← Si overflow, on écrase ça !
+  +4   : [annotation]
+  +104 : [value]
+```
+
+**Si notre input dépasse 104 bytes** :
+- Bytes 0-103 : Remplissent annotation de obj1
+- Bytes 104-107 : **Écrasent la vtable de obj2 !**
+
+---
+
+## Question 4 : vtable hijacking
+
+### Qu'est-ce que le vtable hijacking ?
+
+**vtable hijacking** = Remplacer le pointeur vtable d'un objet par une adresse contrôlée.
+
+**Résultat** : Quand une méthode virtuelle est appelée, le programme saute vers notre adresse.
+
+### Comment on exploite ça ?
+
+**Plan** :
+1. Créer une **fausse vtable** dans notre payload
+2. Overflow obj1 pour **écraser vtable pointer de obj2**
+3. Faire pointer vtable de obj2 vers notre fausse vtable
+4. Quand `obj2->operator+()` est appelé → exécute notre code !
+
+### Qu'est-ce qu'une fausse vtable ?
+
+C'est juste **une adresse qui pointe vers notre shellcode**.
+
+```
+Notre payload :
+0x0804a00c: [0x0804a010] ← Fausse vtable (pointe vers shellcode)
+0x0804a010: [shellcode]  ← Notre code malveillant
+```
+
+**Quand operator+ est appelé** :
+```
+1. Lit obj2->vtable → 0x0804a00c (notre fausse vtable)
+2. Lit première entrée → 0x0804a010 (adresse shellcode)
+3. call 0x0804a010 → Exécute notre shellcode ! ✅
+```
+
+---
+
+## Question 5 : Construction du payload
+
+### Pourquoi mettre la fausse vtable au début ?
+
+```
+Payload : [Fausse vtable][Shellcode][Padding][Adresse fausse vtable]
+```
+
+**Raison** : On contrôle où notre payload est copié (`obj1 + 4 = 0x0804a00c`).
+
+**Si fausse vtable est au début** :
+- Fausse vtable à `0x0804a00c`
+- Elle contient `0x0804a010` (adresse juste après)
+- Shellcode à `0x0804a010`
+
+**C'est prévisible et contrôlable !**
+
+### Calcul du padding
+
+**Objectif** : Atteindre exactement la vtable de obj2.
+
+```
+obj1 = 0x0804a008
+obj1 + 4 = 0x0804a00c  ← Début de notre payload
+obj2 = 0x0804a074       ← Cible (vtable de obj2)
+
+Distance : 0x0804a074 - 0x0804a00c = 0x68 = 104 bytes
+```
+
+**Notre payload** :
+```
+[4 bytes fausse vtable] + [28 bytes shellcode] = 32 bytes déjà écrits
+Padding nécessaire = 104 - 32 = 72 bytes
+
+Mais le walkthrough utilise 76... pourquoi ?
+```
+
+**Correction** : Il faut atteindre `obj2->vtable`, pas `obj2` :
+```
+obj2 = 0x0804a074
+obj2->vtable = obj2 + 0 = 0x0804a074
+
+Mais avec les headers malloc (8 bytes) :
+obj2 réel = 0x0804a074 + 8 = 0x0804a07c ?
+
+Non, les objets sont alloués avec new (C++), pas malloc direct.
+```
+
+**Test empirique recommandé** : Essayer 72, 76, 80 bytes et voir lequel fonctionne.
+
+### Pourquoi pointer vers 0x0804a00c et pas 0x0804a010 ?
+
+**Deux adresses** :
+- `0x0804a00c` : Fausse vtable (contient `0x0804a010`)
+- `0x0804a010` : Shellcode
+
+**Mécanisme** :
+```
+obj2->vtable = 0x0804a00c
+               ↓
+Lit à 0x0804a00c → trouve 0x0804a010
+                   ↓
+                   Appelle 0x0804a010 (shellcode)
+```
+
+**C'est une indirection** : vtable → première entrée → shellcode.
+
+---
+
+## Question 6 : Le shellcode
+
+### Pourquoi un shellcode et pas juste une adresse ?
+
+**Dans les niveaux précédents** : On avait des fonctions existantes (`n()`, `m()`, `o()`).
+
+**Dans level9** : Aucune fonction utile ! On doit **injecter notre propre code**.
+
+**Shellcode** = Code machine exécutable pour lancer `/bin/sh`.
+
+### Pourquoi 28 bytes exactement ?
+
+C'est la taille du shellcode `execve("/bin/sh")` qu'on a choisi.
+
+**Versions** :
+- 21 bytes : Version minimale (level2)
+- 28 bytes : Version avec exit propre
+- 45+ bytes : Versions avec null-byte handling
+
+**Ici** : 28 bytes car on a besoin d'un exit à la fin.
+
+---
+
+## Question 7 : Différence avec les niveaux précédents
+
+### Level6 vs Level9
+
+| | Level6 | Level9 |
+|---|---|---|
+| **Langage** | C | C++ |
+| **Cible** | Function pointer | vtable pointer |
+| **Zone** | Heap | Heap |
+| **Mécanisme** | Overflow → func_ptr | Overflow → vtable |
+| **Code injecté** | Non (fonction existante) | Oui (shellcode) |
+
+### Pourquoi level9 est plus complexe ?
+
+**C++** :
+- Comprendre les objets, vtables, méthodes virtuelles
+- Indirection supplémentaire (vtable → fonction)
+- Layout mémoire plus complexe
+
+**C (level6)** :
+- Structure simple
+- Function pointer direct
+- Pas d'indirection
+
+---
+
+## Question 8 : Debugging
+
+### Comment vérifier les adresses avec GDB ?
+
+```bash
+gdb level9
+
+(gdb) break main
+(gdb) run AAAA
+
+# Après les new
+(gdb) x/20wx 0x0804a000
+# Voir obj1 et obj2
+
+(gdb) print obj1
+# Adresse de obj1
+
+(gdb) print obj2
+# Adresse de obj2
+
+(gdb) x/4wx obj1
+# Voir vtable pointer de obj1
+```
+
+### Comment voir la vtable corruption ?
+
+```bash
+gdb level9
+
+(gdb) break *main+XXX  # Après setAnnotation
+(gdb) run $(python -c 'print "A"*108 + "BBBB"')
+
+(gdb) x/4wx obj2
+# obj2[0] devrait être 0x42424242 ("BBBB") ✅
+```
+
+---
+
+## Résumé des concepts
+
+1. **C++** : Classes, objets, méthodes virtuelles
+2. **vtable** : Table de pointeurs vers méthodes virtuelles
+3. **vtable pointer** : Premier champ de chaque objet
+4. **Heap overflow** : memcpy sans limite
+5. **vtable hijacking** : Remplacer vtable pointer
+6. **Fausse vtable** : Pointer vers notre shellcode
+7. **Indirection** : vtable → entrée → shellcode

