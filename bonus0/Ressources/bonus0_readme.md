@@ -181,25 +181,50 @@ L'adresse de retour est atteinte **9 bytes** dans la 2ème copie de `arg2` (conf
 
 La vulnérabilité clé : `p()` lit 4096 bytes dans `local_100c` (buffer stack de `p()`), mais `strncpy` n'en copie que 20. Le reste du shellcode **reste en mémoire stack** pendant l'exécution de `pp()` et `main()`.
 
+**Pourquoi le shellcode reste en mémoire ?**
+
+Quand `p()` se termine, son stack frame est "libéré" — mais la mémoire n'est pas effacée. Les données restent là jusqu'à ce qu'une autre fonction les écrase. Comme `pp()` et `main()` n'allouent pas autant de stack, `local_100c` reste intact en mémoire.
+
 ```
 Stack de p() au 1er appel :
 local_100c[4096] = [\x90 * 100][shellcode 28B][\x00...]
                     ^-- 20B copiés dans local_34
-                    ^-- le reste reste en stack !
+                    ^-- le reste reste en stack même après le return de p() !
+
+Après return de p() :
+La mémoire à 0xbfffe680 contient toujours [\x90*100][shellcode]
+→ on peut y sauter depuis main() ✅
 ```
 
 L'adresse `0xbfffe680` pointe dans ce grand buffer, accessible après le retour de `p()`.
 
 ### 4. Calcul de l'adresse cible
 
+**Pourquoi ne pas viser directement le début du buffer ?**
+
+Les 61 premiers bytes du buffer sont occupés par nos arguments (20B arg1 + 20B arg2 + 1B espace + 20B arg2 répété). Si EIP atterrit là, le processeur essaie d'exécuter nos `A` ou notre padding → crash.
+
+Il faut viser **après** la fin de nos arguments, dans la zone NOP pure.
+
+**Calcul pas à pas** :
+
 ```
-Base buffer local_100c = 0xbfffe680 (trouvé avec GDB)
-+ 61 bytes (taille des deux inputs + espace) = 0xbfffe6bd  ← fin sécurisée
-+ ~80 bytes (milieu NOP sled)               = 0xbfffe6d0  ← cible idéale
-+ 100 bytes (fin NOP sled)                  = 0xbfffe6e4  ← limite haute
+Base buffer local_100c  = 0xbfffe680  ← trouvé avec GDB
++ 61 bytes (fin des args) = 0xbfffe6bd  ← limite basse, ne pas viser avant
++ ~80 bytes (milieu NOPs) = 0xbfffe6d0  ← cible idéale
++ 100 bytes (fin NOPs)    = 0xbfffe6e4  ← limite haute, shellcode commence ici
 ```
 
-Choisir `0xbfffe6d0` donne une marge confortable des deux côtés.
+**Pourquoi 0xbfffe6d0 ?**
+
+C'est le milieu de la zone NOP — entre la fin des arguments (`0xbfffe6bd`) et le début du shellcode (`0xbfffe6e4`). Ça donne une marge d'environ 20 bytes de chaque côté, ce qui rend l'exploit robuste même si les adresses varient légèrement entre GDB et l'exécution normale.
+
+```
+0xbfffe680 : [buf start]
+0xbfffe6bd : [fin args]      ← ne pas viser avant ici
+0xbfffe6d0 : [← ON VISE ICI] ← milieu du NOP sled
+0xbfffe6e4 : [shellcode]     ← fin du NOP sled
+```
 
 ---
 
@@ -219,14 +244,32 @@ eip = 0x41336141  → offset = 9
 
 ### Étape 2 : Trouver l'adresse du buffer
 
+**Pourquoi désassembler p() ?**
+
+On cherche l'instruction qui charge `local_100c` en mémoire. Dans le désassemblage on voit :
+
 ```bash
 (gdb) disass p
-   0x080484d0 <+28>: lea eax,[ebp-0x1008]   ← local_100c
-(gdb) b *p+28
-(gdb) run
-(gdb) x $ebp-0x1008
-0xbfffe680                                   ← adresse de base
+   0x080484d0 <+28>: lea -0x1008(%ebp),%eax   ← local_100c est à ebp-0x1008
 ```
+
+`lea -0x1008(%ebp)` = "charge l'adresse de ebp - 0x1008" → c'est l'adresse de `local_100c[4096]`.
+
+On met un breakpoint juste là, **avant que `read()` soit appelé** → les objets sont alloués mais le buffer est encore vide.
+
+```bash
+(gdb) b *p+28      ← breakpoint avant read()
+(gdb) run
+# breakpoint déclenché → programme en pause
+(gdb) x $ebp-0x1008   ← lit l'adresse de local_100c
+0xbfffe680            ← adresse de base du grand buffer
+```
+
+**Pourquoi `x $ebp-0x1008` ?**
+
+On sait depuis le désassemblage que `local_100c` est à `ebp - 0x1008`. GDB nous permet de lire directement cette adresse avec `x $ebp-0x1008`.
+
+**Important** : le breakpoint se déclenche **deux fois** — une par appel de `p()`. L'adresse est la même les deux fois (`0xbfffe680`) car `p()` alloue `buf` au même endroit sur la stack à chaque appel.
 
 ### Étape 3 : Assembler le payload final
 

@@ -60,9 +60,17 @@ int main(int argc, char **argv) {
 
 **Layout mémoire (stack)** :
 ```
-[buffer: 40 bytes][nb: 4 bytes]
- ^                 ^
- memcpy écrit ici  cible à écraser
+Stack (adresses hautes → basses) :
+┌──────────────────┐
+│ saved EIP        │
+│ saved EBP        │
+│ nb (4 bytes)     │  ← au-dessus de buffer car déclaré en 1er
+│ buffer[40]       │  ← memcpy écrit ici et déborde vers nb
+└──────────────────┘
+
+memcpy écrit de bas en haut :
+buffer[0..39] → rempli par nos A
+buffer[40..43] → déborde sur nb → écrase nb avec 0x574f4c46
 ```
 
 ---
@@ -79,16 +87,28 @@ Ce filtre protège contre les grandes valeurs **positives** (`10`, `100`, etc.) 
 
 Or un `int` négatif passé comme `size_t` à `memcpy` devient une **énorme valeur positive** (comportement indéfini en C, mais prévisible sur x86).
 
-### 2. Comment memcpy interprète une taille négative
+### 2. Comment nb * 4 produit 44
 
 ```c
 memcpy(buffer, argv[2], nb * 4);
-//                       ^--- size_t (non signé)
 ```
 
-`nb * 4` est calculé en **entier signé 32 bits**, puis **casté en `size_t` (64 bits non signé)** pour `memcpy`. Si le résultat 32 bits est négatif, le cast produit une valeur proche de `2^64` — crashant le programme sauf si on choisit soigneusement la valeur.
+Le processeur calcule `nb * 4` **avant** d'appeler memcpy :
 
-**Astuce** : on ne veut pas vraiment copier `2^64` bytes. On veut que les **32 bits de poids faible** de `nb * 4` valent exactement 44.
+```
+nb * 4 = -2147483637 * 4 = -8589934548
+```
+
+`-8589934548` ne rentre pas dans un int32 → **overflow** → on garde les 32 bits bas :
+
+```
+-8589934548 en binaire (64 bits) :
+1111 1111 1111 1111 1111 1111 1111 1110 | 0000 0000 0000 0000 0000 0000 0010 1100
+←————————— 32 bits hauts ————————————→   ←————————— 32 bits bas ————————————→
+                                                                        = 44 !
+```
+
+memcpy reçoit directement **44** — il ne voit jamais de valeur négative. Il copie simplement 44 bytes normalement. ✅
 
 ### 3. Calcul de la valeur magique
 
@@ -121,14 +141,52 @@ memcpy voit 44 bytes à copier ✅
 
 ### 4. Pourquoi 44 bytes ?
 
-```
-buffer[40] + nb[4] = 44 bytes
+**Rappel du layout stack** :
 
-[AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA][0x574f4c46]
- ←————————————— 40 bytes padding ——————————————————→ ←— nb —→
+La stack grandit vers les adresses basses. Le compilateur place les variables locales dans l'ordre inverse de leur déclaration :
+
+```c
+int main() {
+    int nb;          // déclaré en 1er → plus haut sur la stack
+    char buffer[40]; // déclaré en 2ème → plus bas sur la stack
+}
 ```
 
-Les 40 premiers bytes remplissent `buffer`, les 4 derniers écrasent `nb` avec la valeur magique.
+```
+Stack :
+┌──────────────────┐  adresses hautes
+│ saved EIP        │
+│ saved EBP        │
+│ nb (4 bytes)     │  ← déclaré en 1er → au-dessus de buffer
+│ buffer[40]       │  ← déclaré en 2ème → en dessous de nb
+└──────────────────┘  adresses basses
+```
+
+**Pourquoi buffer est en dessous de nb ?**
+
+`memcpy` écrit vers les **adresses croissantes** (du bas vers le haut). Donc en débordant de `buffer`, on monte naturellement vers `nb` qui est juste au-dessus.
+
+**Le calcul de 44 :**
+
+```
+buffer[0]  ← memcpy commence ici (adresse basse)
+buffer[1]
+...
+buffer[39] ← fin de buffer (40 bytes écrits)
+buffer[40] ← DÉBORDE → début de nb !
+buffer[41]
+buffer[42]
+buffer[43] ← fin du débordement → nb complètement écrasé (4 bytes)
+```
+
+```
+buffer[40] + nb[4] = 44 bytes au total
+
+[A * 40 bytes padding][0x574f4c46]
+ ←— remplit buffer —→  ←— écrase nb —→
+```
+
+**Si buffer était au-dessus de nb**, on ne pourrait pas l'atteindre avec memcpy — on déborderait dans la mauvaise direction. C'est justement parce que `buffer` est déclaré **après** `nb` qu'il se retrouve plus bas sur la stack et qu'on peut déborder vers `nb`.
 
 ### 5. La valeur magique 0x574f4c46
 
@@ -148,26 +206,35 @@ Quand `nb` vaut `0x574f4c46`, la condition `nb == 0x574f4c46` est vraie → `exe
 **Définition** : Dépassement de la capacité d'un type entier, produisant une valeur inattendue.
 
 ```c
-int nb = -2147483637;
-nb * 4 = -8589934548  // Déborde int32 !
-// En int32 : 0x0000002C = 44
-// En size_t (cast) : 0xFFFFFFFF0000002C = ~18 milliards
+nb * 4 = -2147483637 * 4 = -8589934548
 ```
+
+Mais `-8589934548` ne rentre pas dans un int32 (min = -2147483648). Il y a un **overflow** — on garde seulement les **32 bits de poids faible** :
+
+```
+-8589934548 en binaire (64 bits) :
+1111 1111 1111 1111 1111 1111 1111 1110 | 0000 0000 0000 0000 0000 0000 0010 1100
+←————————— 32 bits hauts ————————————→   ←————————— 32 bits bas ————————————→
+                                                                        = 44 !
+```
+
+En int32 on ne garde que les 32 bits bas → **44**.
 
 Le comportement après overflow d'un `int` est **indéfini en C**, mais sur x86 (arithmétique modulaire) le résultat est prévisible.
 
 ### 2. Conversions de types implicites
 
 ```c
-size_t taille = nb * 4;  // int → size_t (conversion implicite)
+memcpy(buffer, argv[2], nb * 4);
+//                       ^--- size_t (non signé)
 ```
 
-| Type | Signé | Taille |
+`nb * 4` est calculé en **int32 signé** → overflow → **44**. Ce résultat est ensuite passé à `memcpy` comme `size_t`. Sur cette VM **32 bits**, `size_t` fait aussi 32 bits → le cast ne change rien, la valeur reste **44**.
+
+| Type | Signé | Taille sur 32 bits |
 |---|---|---|
 | `int` | Oui | 32 bits |
-| `size_t` | Non | 32 ou 64 bits |
-
-La conversion d'un `int` négatif en `size_t` produit une **très grande valeur positive**. Sur une machine 32 bits, `-1` devient `0xFFFFFFFF` = 4 294 967 295.
+| `size_t` | Non | 32 bits |
 
 ### 3. Variable Overwrite vs EIP Overwrite
 
